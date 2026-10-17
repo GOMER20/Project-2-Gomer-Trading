@@ -5,6 +5,7 @@ import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from
 import { AuthGate } from '@/components/AuthGate';
 import { HftPanel } from '@/components/admin/HftPanel';
 import { Panel } from '@/components/ui/Panel';
+import { MoneyPresets, StartingMoney } from '@/components/ui/StartingMoney';
 import { api, API_URL, errorMessage } from '@/lib/api';
 import { desktopBridge } from '@/lib/desktop';
 import { dateTime, localMoment, usd } from '@/lib/format';
@@ -291,8 +292,11 @@ function CreateCompetition({ users, hours, onCreated }: { users: AdminUser[]; ho
         <Field id="competition-end" title="Ends">
           <input id="competition-end" type="datetime-local" value={end} onChange={(e) => setEnd(e.target.value)} required className={`${input} num`} />
         </Field>
-        <Field id="competition-balance" title="Starting balance ($)">
-          <input id="competition-balance" type="number" min={1000} step={1000} value={balance} onChange={(e) => setBalance(e.target.value)} required className={`${input} num`} />
+        <Field id="competition-balance" title="Starting money ($), any amount">
+          <input id="competition-balance" type="number" min={100} max={1_000_000_000} step={1000} value={balance} onChange={(e) => setBalance(e.target.value)} required className={`${input} num`} />
+          <div className="mt-1">
+            <MoneyPresets value={Number(balance)} onPick={(amount) => setBalance(String(amount))} />
+          </div>
         </Field>
         <Field id="competition-leverage" title="Leverage (1 = cash account)">
           <input id="competition-leverage" type="number" min={1} max={10} step={0.5} value={leverage} onChange={(e) => setLeverage(e.target.value)} required className={`${input} num`} />
@@ -487,6 +491,11 @@ function CompetitionRow({ competition, reach, onChanged }: { competition: Compet
         {competition.maintenanceMargin > 0 ? `margin call below ${(competition.maintenanceMargin * 100).toFixed(0)}%` : 'no margin calls'} · {competition.participants} trader
         {competition.participants === 1 ? '' : 's'}
       </p>
+      {competition.status !== 'ENDED' ? (
+        <div className="mt-2">
+          <StartingMoney competitionId={competition.id} competitionName={competition.name} current={competition.startingBalance} onChanged={onChanged} />
+        </div>
+      ) : null}
       {competition.status !== 'ENDED' ? <Invite competition={competition} reach={reach} onChanged={onChanged} /> : null}
       {competition.status !== 'ENDED' ? (
         <form onSubmit={enrol} className="mt-2 flex flex-wrap items-center gap-2">

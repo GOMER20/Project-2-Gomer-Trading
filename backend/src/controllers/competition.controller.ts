@@ -1,6 +1,8 @@
 import type { RequestHandler } from 'express';
+import { Decimal } from 'decimal.js';
 import { z } from 'zod';
 import { config } from '../config.js';
+import { engine } from '../engine/matchingEngine.js';
 import { notFound } from '../lib/errors.js';
 import { currentUser } from '../middleware/auth.js';
 import * as competitions from '../services/competition.service.js';
@@ -47,6 +49,20 @@ export const get: RequestHandler = async (req, res) => {
 /** POST /api/competitions (admin): creates the tournament and funds a portfolio for each listed trader. */
 export const create: RequestHandler = async (req, res) => {
   res.status(201).json(await competitions.createCompetition(createSchema.parse(req.body), currentUser(req)));
+};
+
+/**
+ * PUT /api/competitions/:id/balance (owner): the money every account in the
+ * competition starts with. Each account's cash moves by the difference, so
+ * profits and losses so far are kept; traders who join later get the new amount.
+ */
+export const setBalance: RequestHandler = async (req, res) => {
+  const { id } = idParam.parse(req.params);
+  const { startingBalance } = z.object({ startingBalance: z.number().min(100).max(1_000_000_000) }).parse(req.body);
+  const changed = await engine.setStartingBalance(id, new Decimal(startingBalance).toDecimalPlaces(2));
+  // Written just behind the answer; wait, so whatever the caller reads next already has it.
+  await engine.drained();
+  res.json(changed);
 };
 
 /** POST /api/competitions/:id/participants (admin) */

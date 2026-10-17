@@ -716,6 +716,33 @@ async function main(): Promise<void> {
   }
   check('orders left working are cancelled when the competition ends', swept?.status === 'CANCELLED', swept);
 
+  // -------------------------------------------------------------------------
+  // Starting money: changed for a whole competition, profits and losses kept
+  // -------------------------------------------------------------------------
+  const rich = await api('POST', '/api/competitions', admin, { name: `Smoke money ${run}`, ...window, startingBalance: 100_000, traderIds: [traderA, traderB] });
+  const richId: string = rich.body.competition.id;
+  const bought = await api('POST', '/api/orders', a, { competitionId: richId, ticker: 'MSFT', side: 'BUY', type: 'MARKET', quantity: 150 });
+  check('a trader buys in the competition whose money will change', bought.status === 201 && bought.body.order.status === 'FILLED', bought.body);
+  const beforeA = (await api('GET', `/api/portfolios/${richId}`, a)).body.portfolio;
+  check('a trader cannot change how much money a competition starts with (403)', (await api('PUT', `/api/competitions/${richId}/balance`, a, { startingBalance: 5_000_000 })).status === 403);
+  const raised = await api('PUT', `/api/competitions/${richId}/balance`, admin, { startingBalance: 1_000_000 });
+  check('the owner raises the starting money to $1,000,000 for every account', raised.status === 200 && raised.body.previous === 100_000 && raised.body.startingBalance === 1_000_000 && raised.body.accounts === 2, raised.body);
+  const afterA = (await api('GET', `/api/portfolios/${richId}`, a)).body.portfolio;
+  const afterB = (await api('GET', `/api/portfolios/${richId}`, b)).body.portfolio;
+  check('cash moves by the difference and the position is untouched', near(afterA.cash, beforeA.cash + 900_000, 0.011) && afterA.positions[0]?.quantity === 150 && afterA.startingBalance === 1_000_000, { beforeA, afterA });
+  check('profit and loss are the same as before (only the market moves them)', Math.abs(afterA.realizedPnl - beforeA.realizedPnl) < 0.011 && Math.abs(afterA.totalPnl - beforeA.totalPnl) < 50, { before: beforeA.totalPnl, after: afterA.totalPnl });
+  check('an account that had not traded now holds exactly the new amount', near(afterB.cash, 1_000_000) && near(afterB.totalPnl, 0), afterB);
+  const listed = (await api('GET', `/api/competitions/${richId}`, admin)).body.competition;
+  check('the competition itself records the new amount', listed?.startingBalance === 1_000_000, listed);
+  const bigOrder = await api('POST', '/api/orders', b, { competitionId: richId, ticker: 'MSFT', side: 'BUY', type: 'MARKET', quantity: 1500 });
+  check('the extra money can be traded with at once', bigOrder.status === 201 && bigOrder.body.order.status === 'FILLED', bigOrder.body);
+  const tooLow = await api('PUT', `/api/competitions/${richId}/balance`, admin, { startingBalance: 1_000 });
+  check('lowering it below what someone has already spent is refused, with the least it can be', tooLow.status === 409 && /least it can start with/.test(tooLow.body.error.message), tooLow.body);
+  check('the money of a finished competition cannot be changed', (await api('PUT', `/api/competitions/${sprintId}/balance`, admin, { startingBalance: 1_000_000 })).status === 409);
+  const lowered = await api('PUT', `/api/competitions/${richId}/balance`, admin, { startingBalance: 900_000 });
+  const loweredA = (await api('GET', `/api/portfolios/${richId}`, a)).body.portfolio;
+  check('it can be lowered again, and cash falls by the difference', lowered.status === 200 && near(loweredA.cash, afterA.cash - 100_000, 0.011), { lowered: lowered.body, cash: loweredA.cash });
+
   feed.close();
   console.log(`\n${failed === 0 ? '\x1b[32m' : '\x1b[31m'}${passed} passed, ${failed} failed\x1b[0m`);
   process.exit(failed === 0 ? 0 : 1);

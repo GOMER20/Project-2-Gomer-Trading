@@ -63,6 +63,13 @@ export interface WriteSet {
   executions: ExecutionWrite[];
   positions: PositionWrite[];
   portfolios: PortfolioWrite[];
+  /** A competition's starting money, changed together with every account's cash (see setStartingBalance). */
+  competitions?: CompetitionWrite[];
+}
+
+export interface CompetitionWrite {
+  id: string;
+  starting_balance: string;
 }
 
 const MAX_BATCH = 400;
@@ -117,11 +124,13 @@ async function apply(sets: WriteSet[]): Promise<void> {
   const orders = new Map<string, OrderRow>();
   const positions = new Map<string, PositionWrite>();
   const portfolios = new Map<string, PortfolioWrite>();
+  const competitions = new Map<string, CompetitionWrite>();
   const executions: ExecutionWrite[] = [];
   for (const set of sets) {
     for (const order of set.orders) orders.set(order.id, order);
     for (const position of set.positions) positions.set(`${position.portfolio_id}|${position.ticker}`, position);
     for (const portfolio of set.portfolios) portfolios.set(portfolio.id, portfolio);
+    for (const competition of set.competitions ?? []) competitions.set(competition.id, competition);
     executions.push(...set.executions);
   }
   const closed = [...positions.values()].filter((p) => p.quantity === 0);
@@ -174,6 +183,14 @@ async function apply(sets: WriteSet[]): Promise<void> {
            FROM json_to_recordset($1::json) AS now(id uuid, cash numeric, realized_pnl numeric, commissions numeric, total_equity numeric, buying_power numeric)
           WHERE p.id = now.id`,
         [JSON.stringify([...portfolios.values()])],
+      );
+    }
+    if (competitions.size) {
+      await client.query(
+        `UPDATE competitions c SET starting_balance = now.starting_balance
+           FROM json_to_recordset($1::json) AS now(id uuid, starting_balance numeric)
+          WHERE c.id = now.id`,
+        [JSON.stringify([...competitions.values()])],
       );
     }
     await client.query('UPDATE engine_journal SET applied_seq = $1 WHERE applied_seq < $1', [sets.at(-1)!.seq]);

@@ -2,7 +2,8 @@
 
 A real-time paper trading terminal in the style of a professional day-trading
 desk such as Sterling Trader Pro. Traders log in with a Trader ID and password,
-get an isolated $100,000 virtual account per competition, trade against live
+get an isolated virtual account per competition ($100,000 unless the organiser
+chooses another amount), trade against live
 Level 1 quotes, and are ranked on a live leaderboard. When the competition ends
 it is settled and the winner is declared.
 
@@ -55,6 +56,17 @@ How it is put together is in [`desktop/main.mjs`](desktop/main.mjs) (the shell) 
 
 Everyone trades in one shared competition on one machine, and joins from a web
 browser. Nobody but the host installs anything.
+
+**How much money.** Each competition sets the money every account starts with:
+any amount from $100 to $1,000,000,000 (one click for $100K, $1M, $10M or
+$100M). It can be changed while the competition runs, from the admin console
+(the competition → *Starting money → Change*) or, for AT's sandbox, from the AT
+window. Every account in the competition gets the difference added to, or taken
+from, its cash, so what each trader has made or lost so far stays exactly the
+same and the leaderboard measures from the new amount; traders who join later
+start with it. It cannot be lowered below what someone has already spent, and a
+finished competition's results are final. The change is one journal entry for
+all the accounts and the competition together, so it survives a crash whole.
 
 **Inviting people.** Every competition has a six-character **invite code**
 (Admin console → the competition → *Copy invite link*). Whoever opens the link,
@@ -490,6 +502,7 @@ All routes are under `/api` and, except login, need `Authorization: Bearer <jwt>
 | `GET /competitions` | user | Competitions you are in (admins see all) |
 | `POST /competitions` | admin | Create a tournament, optionally enrolling `traderIds` |
 | `POST /competitions/:id/participants` | admin | Enrol traders, each with a fresh starting balance (idempotent) |
+| `PUT /competitions/:id/balance` | owner | Change the money every account starts with `{ startingBalance }`; cash moves by the difference |
 | `GET /competitions/:id/leaderboard` | participant | Top N from Redis plus your own rank |
 | `GET /competitions/:id/results` | participant | Every trader's standing and record; the winner once final |
 | `GET /portfolios/:competitionId` | user | Cash, buying power, equity, P&L, open positions |

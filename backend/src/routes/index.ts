@@ -46,6 +46,7 @@ const competitionRoutes = Router()
   .get('/:id/leaderboard', competitions.leaderboard)
   .get('/:id/results', competitions.results)
   .put('/:id/invite', admin, competitions.setInvite)
+  .put('/:id/balance', requireOwner, competitions.setBalance)
   .get('/:id/participants', admin, competitions.listParticipants)
   .post('/:id/participants', admin, competitions.addParticipants);
 

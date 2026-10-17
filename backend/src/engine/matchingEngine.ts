@@ -579,6 +579,65 @@ export class MatchingEngine extends EventEmitter<{ order: [OrderEvent] }> {
   }
 
   /**
+   * Changes how much money a competition starts with. Every account in it has
+   * its cash moved by the difference, so what each has made or lost so far
+   * stays exactly the same, and its leaderboard and results measure from the
+   * new amount. Traders who join later start with the new amount. The accounts
+   * and the competition change in one journal entry: all of it or none.
+   */
+  async setStartingBalance(competitionId: string, amount: Decimal): Promise<{ previous: number; startingBalance: number; accounts: number }> {
+    const { rows } = await pool.query<{ starting_balance: string; end_date: Date; settled_at: Date | null }>(
+      'SELECT starting_balance, end_date, settled_at FROM competitions WHERE id = $1',
+      [competitionId],
+    );
+    const competition = rows[0];
+    if (!competition) throw notFound('That competition does not exist.');
+    if (competition.settled_at || competition.end_date <= new Date()) throw conflict('This competition has ended, so its results are final and its money cannot be changed.');
+
+    const { rows: portfolios } = await pool.query<{ id: string }>('SELECT id FROM portfolios WHERE competition_id = $1', [competitionId]);
+    const accounts = (await Promise.all(portfolios.map((portfolio) => this.ledger.load(portfolio.id)))).filter((account): account is LiveAccount => account !== null);
+
+    // From here to the journal entry nothing is awaited, so no order can come in between.
+    // Memory is ahead of the database, so the amount the accounts started with is read from them.
+    const previous = accounts[0]?.startingBalance ?? new Decimal(competition.starting_balance);
+    const difference = amount.minus(previous);
+    const poorest = accounts.reduce<LiveAccount | null>((low, account) => (!low || account.cash.lt(low.cash) ? account : low), null);
+    if (poorest && poorest.cash.plus(difference).lt(0)) {
+      const lowest = previous.minus(poorest.cash).toDecimalPlaces(2, Decimal.ROUND_UP);
+      throw new AppError(409, 'BALANCE_TOO_LOW', `Someone in this competition has already spent more than that. The least it can start with now is $${lowest.toNumber().toLocaleString('en-US')}.`);
+    }
+
+    for (const account of accounts) {
+      account.cash = account.cash.plus(difference);
+      account.startingBalance = amount;
+    }
+    try {
+      this.store.append({
+        orders: [],
+        executions: [],
+        positions: [],
+        portfolios: accounts.map((account) => {
+          const valuation = valuePortfolio(account.cash, account.positions, this.markOf, account.rules.leverage);
+          return {
+            id: account.id,
+            cash: account.cash.toFixed(4),
+            realized_pnl: account.realizedPnl.toFixed(4),
+            commissions: account.commissions.toFixed(4),
+            total_equity: valuation.equity.toFixed(4),
+            buying_power: valuation.buyingPower.toFixed(4),
+          };
+        }),
+        competitions: [{ id: competitionId, starting_balance: amount.toFixed(2) }],
+      });
+    } catch (err) {
+      logger.fatal({ err }, 'The engine could not write its journal. Restarting from the database.');
+      process.exit(1);
+    }
+    logger.info({ competitionId, from: previous.toNumber(), to: amount.toNumber(), accounts: accounts.length }, 'Starting money changed');
+    return { previous: previous.toNumber(), startingBalance: amount.toNumber(), accounts: accounts.length };
+  }
+
+  /**
    * Makes a decision real: files the orders it touched, journals what
    * changed, and tells the market and the traders. Nothing here waits.
    */

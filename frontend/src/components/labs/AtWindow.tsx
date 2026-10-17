@@ -2,6 +2,7 @@
 
 import { useCallback, useMemo, useState, type ReactNode } from 'react';
 import { EmptyState, Panel } from '@/components/ui/Panel';
+import { StartingMoney } from '@/components/ui/StartingMoney';
 import { dateTime, duration, pnlColor, price, shares, signedUsd, usd } from '@/lib/format';
 import { percent, successRate, usePoll, type AtAccount, type AtDashboard, type AtReports, type AtStats } from '@/lib/labs';
 import { RunningTotalChart } from './LabChart';
@@ -299,7 +300,7 @@ function ReportSessions({ reports }: { reports: AtReports }) {
 // --- the window -------------------------------------------------------------------
 
 export function AtWindow() {
-  const { data, error } = usePoll<AtDashboard>('/api/at', 5_000);
+  const { data, error, reload } = usePoll<AtDashboard>('/api/at', 5_000);
   const [chosen, setChosen] = useState<string | null>(null);
   const account = data?.accounts.find((a) => a.portfolioId === chosen) ?? data?.accounts[0] ?? null;
   // Rebuilt only when a trade finishes, not on every refresh, so the chart keeps its place.
@@ -360,6 +361,19 @@ export function AtWindow() {
                 </button>
               ))}
             </nav>
+          ) : null}
+
+          {account.competition.status !== 'ENDED' && account.portfolio ? (
+            // More money for AT: changes every account in this competition (in AT's own sandbox, only AT's).
+            <div className="rounded-sm border border-line bg-panel px-3 py-2">
+              <StartingMoney
+                key={account.portfolioId}
+                competitionId={account.competition.id}
+                competitionName={account.competition.name}
+                current={account.portfolio.startingBalance}
+                onChanged={reload}
+              />
+            </div>
           ) : null}
 
           <Headline account={account} />
