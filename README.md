@@ -40,6 +40,8 @@ installed or running.
 - **Live prices.** Click the **Simulated market** badge (or *Gomer Trading → Market Data…*) and paste your market-data key. See [Real-time prices](#real-time-prices).
 - **Self-healing.** If the trading server or the leaderboard worker ever stops, the app restarts it and the window reconnects by itself.
 - **Closing the window.** Normally closing the window quits the app. While it is shared (on the internet or on your network) it is a server for other people, so closing the window leaves it running in the Dock with the link up; click the Dock icon to get the window back. *Quit* then asks before taking the link down. Shutting down or logging out is never held up.
+- **Staying awake for the market.** From 15 minutes before the US open (AT starts itself ten minutes before) to the close, the app keeps the Mac from going to sleep, so the practice market, AT and HFT all run (*Trading → Keep Mac Awake During US Market Hours* switches it off). One thing no app can override: with the lid closed on battery, macOS sleeps anyway. So when the open is near and the Mac is on battery, the app says so, and if the Mac did sleep through part of a session it tells you which stretch was missed.
+- **Old copies tidied.** The app keeps the newest three copies taken before an update (`backups/before-upgrade-*.tgz`, about 17 MB each) and moves older ones to the Trash, where they can still be recovered. Its own automatic backups (small, every six hours) are kept for a week as before.
 - **Backups.** The app saves a backup of every account, competition and trade by itself: shortly after it starts and every six hours while it is open, keeping about a week of them. *Help → Back Up Now* makes one on the spot, *Open Backups Folder* shows them, and *Restore a Backup…* puts one back (the current data is backed up first, so a restore can be undone). *Reset All Data…* also saves a backup before erasing. A backup is one small `.gtbackup` file of data, so it can be restored on another Mac or into a later version; copy one off this Mac now and then, because backups kept only here do not survive losing the Mac.
 - `npm run app:dev` runs the app straight from the source tree without packaging.
 
@@ -67,6 +69,16 @@ same and the leaderboard measures from the new amount; traders who join later
 start with it. It cannot be lowered below what someone has already spent, and a
 finished competition's results are final. The change is one journal entry for
 all the accounts and the competition together, so it survives a crash whole.
+
+**More money for one account.** One account can also be given its own amount
+(admin console → the competition → *Money for one account*, or *AT's starting
+money* in the AT window), leaving everyone else as they are. Its cash moves by
+the difference, so its profit and loss are kept, and its return is measured
+from its own amount. The leaderboard and the final results therefore rank by
+**return** (profit as a share of the money each trader started with): when
+everyone starts with the same amount this is exactly the order of their equity,
+and an account given more money gets no head start. Changing the whole
+competition afterwards keeps the one account's extra.
 
 **Inviting people.** Every competition has a six-character **invite code**
 (Admin console → the competition → *Copy invite link*). Whoever opens the link,
@@ -231,6 +243,56 @@ What test mode is not: HFT's fills and the exchange's are worked out from
 different books, so they agree only roughly; and orders that were already
 working when a session began are not copied into it.
 
+### The realistic sandbox: HFT decides the fills
+
+A competition created with **Realistic fills** (*Admin console → New
+competition*, or `fillModel: "hft"` over the API) is not filled from the
+modelled book. Its orders are matched by an HFT of its own
+([`backend/src/hft/hftVenue.ts`](backend/src/hft/hftVenue.ts)), and every other
+competition carries on exactly as before.
+
+- **Orders wait in line.** The market's own bids and offers rest in HFT's book
+  as real orders: for every quote, the ten-level book `market/depth.ts` models
+  for it. An order joins the back of the queue at its price. When the market
+  shows less at a price, its newest orders there go first, whole.
+- **The market's trades are real.** Each trade the feed prints goes into HFT as
+  an order from "the street", at the print's price and size, and trades with
+  the queue it meets in time order: the market's own orders first, then
+  whoever joined after them.
+- **The market moving through an order fills it** at the order's own price, as
+  in standard competitions.
+- **Orders take time to arrive.** Each order and cancel reaches the book after
+  the competition's *order delay*, plus up to half as much again at random.
+  An order can fill while its cancel is on the way, and a cancel is reported
+  only when HFT confirms it.
+- **The engine still owns every account.** It checks each order's risk, books
+  every fill and reports it; only the matching happens in HFT. A market order
+  there trades what the book holds and has the rest cancelled, as an IOC does.
+  Stop orders wait in the engine until their price is reached, then go to HFT.
+
+Each realistic competition gets its own HFT process, started with its first
+order, so that sandboxes can never trade with each other (traders in one
+sandbox do trade with each other). At most four run at once. Each records its
+sessions under `hft-venue/<competition>/`, capped at 100 MB a session with two
+kept (`HFT_VENUE_RECORD_LIMIT_MB`, `HFT_VENUE_KEEP_SESSIONS`): 200 MB at most a
+sandbox. *Admin console → HFT* shows each one: orders working, fills, and how
+many of the street's shares reached traders.
+
+### HFT Strategy
+
+HFT Strategy is a market-making program from Project 1 (`hftbot`) that trades
+here through the binary gateway, in a realistic sandbox. It is started by hand,
+never by itself, and writes `status.json` once a second, its session reports
+and the market it saw to `hft-strategy/` in the data folder.
+
+*Admin console → HFT Strategy · market maker* shows it while it runs: its
+success rate as "X% (N of M trades)", live profit and loss (the exchange's own
+figure for its account), each trade's average, its worst trade and drawdown,
+its fill rate and adverse selection, what it holds, and how long its orders
+take to be answered. **Kill switch** tells it to withdraw every order, close
+every position and stop; if it is not running, the exchange cancels the
+account's orders and closes its positions itself.
+
 ## The AT and HFT windows
 
 Gomer Trading is one of three projects that fit together (see the
@@ -384,6 +446,14 @@ Project 2/
 | Stop-limit | Waits for the stop price, then works as a limit order, so it never fills beyond the limit. |
 
 A buy stop must be above the market and a sell stop below it; the ticket says so if not.
+
+**Alerts** (the *Alerts* tab under the chart). A short chime when an order fills,
+and a system notification when the app is not the window in front; both can be
+switched off. **Price alerts**: pick a symbol, type a price and you are told the
+moment it gets there (on screen, with a chime and a notification); it works out
+for itself whether that means rising or falling to it, and goes off once. Price
+alerts are checked in the terminal against every quote, so they work while the
+terminal is open (the desktop app keeps it open in the Dock).
 
 **Brackets.** Switch **Bracket** on in the ticket and give a *Target +* and a
 *Stop −*, each a distance in dollars per share from the entry (either can be

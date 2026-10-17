@@ -51,6 +51,8 @@ export interface PositionWrite {
 export interface PortfolioWrite {
   id: string;
   cash: string;
+  /** Only when it changed; left out, the stored value stays. */
+  funding?: string;
   realized_pnl: string;
   commissions: string;
   total_equity: string;
@@ -129,7 +131,11 @@ async function apply(sets: WriteSet[]): Promise<void> {
   for (const set of sets) {
     for (const order of set.orders) orders.set(order.id, order);
     for (const position of set.positions) positions.set(`${position.portfolio_id}|${position.ticker}`, position);
-    for (const portfolio of set.portfolios) portfolios.set(portfolio.id, portfolio);
+    for (const portfolio of set.portfolios) {
+      // A later change to the account wins, but a funding change earlier in the batch is not lost by one that left it out.
+      const before = portfolios.get(portfolio.id);
+      portfolios.set(portfolio.id, { ...portfolio, funding: portfolio.funding ?? before?.funding });
+    }
     for (const competition of set.competitions ?? []) competitions.set(competition.id, competition);
     executions.push(...set.executions);
   }
@@ -179,8 +185,8 @@ async function apply(sets: WriteSet[]): Promise<void> {
       await client.query(
         `UPDATE portfolios p
             SET cash = now.cash, realized_pnl = now.realized_pnl, commissions = now.commissions,
-                total_equity = now.total_equity, buying_power = now.buying_power
-           FROM json_to_recordset($1::json) AS now(id uuid, cash numeric, realized_pnl numeric, commissions numeric, total_equity numeric, buying_power numeric)
+                total_equity = now.total_equity, buying_power = now.buying_power, funding = COALESCE(now.funding, p.funding)
+           FROM json_to_recordset($1::json) AS now(id uuid, cash numeric, realized_pnl numeric, commissions numeric, total_equity numeric, buying_power numeric, funding numeric)
           WHERE p.id = now.id`,
         [JSON.stringify([...portfolios.values()])],
       );

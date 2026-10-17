@@ -24,6 +24,10 @@ const createSchema = z
     commissionPerShare: z.number().min(0).max(1).default(0),
     // Margin call level as a fraction, e.g. 0.25. Zero switches margin calls off.
     maintenanceMargin: z.number().min(0).max(0.9).default(0.25),
+    // standard: fills from the modelled book. hft: the realistic sandbox, where HFT decides them,
+    // orders wait in line and each order and cancel takes orderDelayMs (and a little more) to arrive.
+    fillModel: z.enum(['standard', 'hft']).default('standard'),
+    orderDelayMs: z.number().int().min(0).max(10_000).default(0),
     traderIds: traderIds.default([]),
     openToInvites: z.boolean().default(true),
   })
@@ -61,6 +65,19 @@ export const setBalance: RequestHandler = async (req, res) => {
   const { startingBalance } = z.object({ startingBalance: z.number().min(100).max(1_000_000_000) }).parse(req.body);
   const changed = await engine.setStartingBalance(id, new Decimal(startingBalance).toDecimalPlaces(2));
   // Written just behind the answer; wait, so whatever the caller reads next already has it.
+  await engine.drained();
+  res.json(changed);
+};
+
+/**
+ * PUT /api/accounts/:portfolioId/balance (owner): the money one account starts
+ * with, leaving everyone else in its competition as they are. Its cash moves by
+ * the difference; profits and losses so far are kept.
+ */
+export const setAccountBalance: RequestHandler = async (req, res) => {
+  const { portfolioId } = z.object({ portfolioId: z.uuid() }).parse(req.params);
+  const { startingBalance } = z.object({ startingBalance: z.number().min(100).max(1_000_000_000) }).parse(req.body);
+  const changed = await engine.fundAccount(portfolioId, new Decimal(startingBalance).toDecimalPlaces(2));
   await engine.drained();
   res.json(changed);
 };

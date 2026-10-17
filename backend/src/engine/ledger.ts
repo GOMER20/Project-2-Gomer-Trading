@@ -30,7 +30,10 @@ export interface LiveAccount {
   userId: string;
   competitionId: string;
   rules: AccountRules;
+  /** What this account started with: the competition's starting money plus its own funding. */
   startingBalance: Decimal;
+  /** Money given to (or taken from) this account alone, on top of the competition's starting money. */
+  funding: Decimal;
   cash: Decimal;
   realizedPnl: Decimal;
   commissions: Decimal;
@@ -48,6 +51,7 @@ interface AccountRow {
   cash: string;
   realized_pnl: string;
   commissions: string;
+  funding: string;
   start_date: Date;
   end_date: Date;
   allow_shorting: boolean;
@@ -55,6 +59,8 @@ interface AccountRow {
   starting_balance: string;
   commission_per_share: string;
   maintenance_margin: string;
+  fill_model: string;
+  order_delay_ms: number;
 }
 
 /**
@@ -142,8 +148,9 @@ export class Ledger {
     // to be written, so four plain reads see one consistent account.
     const [found, positions, working, clientIds] = await Promise.all([
       pool.query<AccountRow>(
-        `SELECT p.id, p.user_id, p.competition_id, p.cash, p.realized_pnl, p.commissions,
-                c.start_date, c.end_date, c.allow_shorting, c.leverage, c.starting_balance, c.commission_per_share, c.maintenance_margin
+        `SELECT p.id, p.user_id, p.competition_id, p.cash, p.realized_pnl, p.commissions, p.funding,
+                c.start_date, c.end_date, c.allow_shorting, c.leverage, c.starting_balance, c.commission_per_share, c.maintenance_margin,
+                c.fill_model, c.order_delay_ms
            FROM portfolios p
            JOIN competitions c ON c.id = p.competition_id
           WHERE p.id = $1`,
@@ -170,8 +177,11 @@ export class Ledger {
         leverage: new Decimal(row.leverage),
         commissionPerShare: new Decimal(row.commission_per_share),
         maintenanceMargin: new Decimal(row.maintenance_margin),
+        fillModel: row.fill_model === 'hft' ? 'hft' : 'standard',
+        orderDelayMs: Number(row.order_delay_ms ?? 0),
       },
-      startingBalance: new Decimal(row.starting_balance),
+      startingBalance: new Decimal(row.starting_balance).plus(row.funding),
+      funding: new Decimal(row.funding),
       cash: new Decimal(row.cash),
       realizedPnl: new Decimal(row.realized_pnl),
       commissions: new Decimal(row.commissions),

@@ -24,7 +24,9 @@ function Row({ entry, mine }: { entry: LeaderboardEntry; mine: boolean }) {
           {mine ? <span className="shrink-0 text-[10px] font-semibold uppercase text-accent">you</span> : null}
         </span>
       </td>
-      <td className="num py-1.5 pr-2 text-right text-xs text-ink">{usd(entry.equity)}</td>
+      <td className="num py-1.5 pr-2 text-right text-xs text-ink" title={entry.startingBalance ? `Started with ${usd(entry.startingBalance)}` : undefined}>
+        {usd(entry.equity)}
+      </td>
       <td className={`num py-1.5 pr-2 text-right text-xs ${pnlColor(entry.pnl)}`}>{signedPct(entry.returnPct)}</td>
     </tr>
   );
@@ -37,7 +39,7 @@ function Freshness({ updatedAt }: { updatedAt: string | null }) {
   return <span className="num text-[10px] normal-case tracking-normal text-faint">{seconds < 2 ? 'just now' : `${seconds}s ago`}</span>;
 }
 
-/** Top traders by total equity, read from the Redis sorted set the worker maintains. */
+/** Top traders by return on the money each started with, read from the Redis sorted set the worker maintains. */
 export function Leaderboard({ active, final, onShowResults }: { active: boolean; final: boolean; onShowResults: () => void }) {
   const board = useTradingStore((s) => s.leaderboard);
   const traderId = useAuthStore((s) => s.user?.traderId);
@@ -94,7 +96,7 @@ export function Leaderboard({ active, final, onShowResults }: { active: boolean;
             </table>
           </div>
           <p className="shrink-0 border-t border-line px-2.5 py-1 text-[10px] text-faint">
-            {board.participants} trader{board.participants === 1 ? '' : 's'} · ranked by total equity
+            {board.participants} trader{board.participants === 1 ? '' : 's'} · ranked by return
           </p>
         </div>
       )}

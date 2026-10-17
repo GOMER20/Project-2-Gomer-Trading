@@ -18,6 +18,10 @@ export interface CompetitionDto {
   commissionPerShare: number;
   /** Margin call level: equity below this share of gross exposure liquidates the account. Zero switches it off. */
   maintenanceMargin: number;
+  /** standard: fills come from the modelled book. hft: the realistic sandbox, where HFT decides them. */
+  fillModel: 'standard' | 'hft';
+  /** With fill model hft: milliseconds an order or cancel takes to reach the book. */
+  orderDelayMs: number;
   status: CompetitionStatus;
   /** True once an ended competition has been settled and its standings are final. */
   final: boolean;
@@ -37,6 +41,8 @@ export interface NewCompetition {
   leverage: number;
   commissionPerShare: number;
   maintenanceMargin: number;
+  fillModel: 'standard' | 'hft';
+  orderDelayMs: number;
   traderIds: string[];
   /** Create an invite code so people can sign themselves up. */
   openToInvites: boolean;
@@ -61,6 +67,8 @@ const toDto = (row: CompetitionListRow, forAdmin = false): CompetitionDto => ({
   leverage: Number(row.leverage),
   commissionPerShare: Number(row.commission_per_share),
   maintenanceMargin: Number(row.maintenance_margin),
+  fillModel: row.fill_model,
+  orderDelayMs: row.order_delay_ms,
   status: competitionStatus(row),
   final: row.settled_at !== null,
   participants: row.participants,
@@ -139,10 +147,10 @@ export async function createCompetition(
 ): Promise<{ competition: CompetitionDto; enrollment: EnrollmentResult }> {
   const { id, enrollment } = await withTransaction(async (client) => {
     const { rows } = await client.query<{ id: string }>(
-      `INSERT INTO competitions (name, start_date, end_date, starting_balance, allow_shorting, leverage, commission_per_share, maintenance_margin, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      `INSERT INTO competitions (name, start_date, end_date, starting_balance, allow_shorting, leverage, commission_per_share, maintenance_margin, fill_model, order_delay_ms, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        RETURNING id`,
-      [input.name, input.startDate, input.endDate, input.startingBalance, input.allowShorting, input.leverage, input.commissionPerShare, input.maintenanceMargin, createdBy.id],
+      [input.name, input.startDate, input.endDate, input.startingBalance, input.allowShorting, input.leverage, input.commissionPerShare, input.maintenanceMargin, input.fillModel, input.orderDelayMs, createdBy.id],
     );
     const competitionId = rows[0]!.id;
     if (input.openToInvites) await setInvite(competitionId, true, client);
@@ -153,18 +161,22 @@ export async function createCompetition(
 
 export async function listParticipants(
   competitionId: string,
-): Promise<Array<{ traderId: string; displayName: string; totalEquity: number; cash: number }>> {
-  const { rows } = await pool.query<{ trader_id: string; display_name: string; total_equity: string; cash: string }>(
-    `SELECT u.trader_id, u.display_name, p.total_equity, p.cash
+): Promise<Array<{ portfolioId: string; traderId: string; displayName: string; isBot: boolean; startingBalance: number; totalEquity: number; cash: number }>> {
+  const { rows } = await pool.query<{ id: string; trader_id: string; display_name: string; is_bot: boolean; starting_balance: string; total_equity: string; cash: string }>(
+    `SELECT p.id, u.trader_id, u.display_name, u.is_bot, c.starting_balance + p.funding AS starting_balance, p.total_equity, p.cash
        FROM portfolios p
        JOIN users u ON u.id = p.user_id
+       JOIN competitions c ON c.id = p.competition_id
       WHERE p.competition_id = $1
-      ORDER BY p.total_equity DESC, u.trader_id`,
+      ORDER BY u.trader_id`,
     [competitionId],
   );
   return rows.map((r) => ({
+    portfolioId: r.id,
     traderId: r.trader_id,
     displayName: r.display_name,
+    isBot: r.is_bot,
+    startingBalance: Number(r.starting_balance),
     totalEquity: Number(r.total_equity),
     cash: Number(r.cash),
   }));

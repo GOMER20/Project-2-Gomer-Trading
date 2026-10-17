@@ -31,11 +31,27 @@ export function MoneyPresets({ value, onPick }: { value: number; onPick: (amount
 }
 
 /**
- * The money a competition's accounts start with, and the switch to change it.
- * Every account in the competition has its cash moved by the difference, so
- * profits and losses so far are kept; traders who join later get the new amount.
+ * The money accounts start with, and the switch to change it: for a whole
+ * competition (every account's cash moves by the difference; traders who join
+ * later get the new amount), or with `account` for that one account alone. In
+ * both, profits and losses so far are kept.
  */
-export function StartingMoney({ competitionId, competitionName, current, onChanged }: { competitionId: string; competitionName: string; current: number; onChanged?: () => void }) {
+export function StartingMoney({
+  competitionId,
+  competitionName,
+  current,
+  onChanged,
+  account,
+  label = 'Starting money',
+}: {
+  competitionId: string;
+  competitionName: string;
+  current: number;
+  onChanged?: () => void;
+  /** Change this one account only. */
+  account?: { portfolioId: string; name: string };
+  label?: string;
+}) {
   const [editing, setEditing] = useState(false);
   const [amount, setAmount] = useState(String(current));
   const [busy, setBusy] = useState(false);
@@ -48,12 +64,20 @@ export function StartingMoney({ competitionId, competitionName, current, onChang
     if (!valid) return;
     setBusy(true);
     try {
-      const changed = await api<{ previous: number; startingBalance: number; accounts: number }>(`/api/competitions/${competitionId}/balance`, { method: 'PUT', body: { startingBalance: value } });
-      const moved = changed.startingBalance - changed.previous;
-      setNotice({
-        ok: true,
-        text: `${competitionName} now starts with ${usd(changed.startingBalance)}. ${changed.accounts} account${changed.accounts === 1 ? '' : 's'} had ${signedUsd(moved)} added to cash; profits and losses so far are unchanged.`,
-      });
+      if (account) {
+        const changed = await api<{ previous: number; startingBalance: number }>(`/api/accounts/${account.portfolioId}/balance`, { method: 'PUT', body: { startingBalance: value } });
+        setNotice({
+          ok: true,
+          text: `${account.name} now starts with ${usd(changed.startingBalance)} (${signedUsd(changed.startingBalance - changed.previous)} to its cash); nobody else in ${competitionName} changed. The leaderboard ranks by return, so more money is no head start.`,
+        });
+      } else {
+        const changed = await api<{ previous: number; startingBalance: number; accounts: number }>(`/api/competitions/${competitionId}/balance`, { method: 'PUT', body: { startingBalance: value } });
+        const moved = changed.startingBalance - changed.previous;
+        setNotice({
+          ok: true,
+          text: `${competitionName} now starts with ${usd(changed.startingBalance)}. ${changed.accounts} account${changed.accounts === 1 ? '' : 's'} had ${signedUsd(moved)} added to cash; profits and losses so far are unchanged.`,
+        });
+      }
       setEditing(false);
       onChanged?.();
     } catch (err) {
@@ -67,13 +91,13 @@ export function StartingMoney({ competitionId, competitionName, current, onChang
     <div className="text-[11px]">
       {editing ? (
         <form onSubmit={save} className="flex flex-wrap items-center gap-2">
-          <span className="text-faint">Starting money</span>
+          <span className="text-faint">{label}</span>
           <MoneyPresets value={value} onPick={(picked) => setAmount(String(picked))} />
           <input
             type="number"
             min={100}
             max={1_000_000_000}
-            step={1000}
+            step="any"
             value={amount}
             onChange={(e) => setAmount(e.target.value)}
             aria-label="Starting money in dollars"
@@ -85,11 +109,15 @@ export function StartingMoney({ competitionId, competitionName, current, onChang
           <button type="button" onClick={() => setEditing(false)} className="h-7 rounded-sm border border-line px-2 text-xs text-dim hover:text-ink">
             Cancel
           </button>
-          <span className="w-full text-faint">Every account in this competition gets the difference added to (or taken from) its cash, so what each has made or lost so far stays the same.</span>
+          <span className="w-full text-faint">
+            {account
+              ? `Only ${account.name}'s account changes: the difference is added to (or taken from) its cash, so what it has made or lost so far stays the same.`
+              : 'Every account in this competition gets the difference added to (or taken from) its cash, so what each has made or lost so far stays the same.'}
+          </span>
         </form>
       ) : (
         <span className="flex flex-wrap items-center gap-2">
-          <span className="text-faint">Starting money</span>
+          <span className="text-faint">{label}</span>
           <span className="num text-ink">{usd(current)}</span>
           <button
             type="button"

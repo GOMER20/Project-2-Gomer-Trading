@@ -3,7 +3,7 @@ import { pool } from '../db/pool.js';
 import { engine, type OrderEvent } from '../engine/matchingEngine.js';
 import { logger } from '../lib/logger.js';
 import { keys, redis } from '../redis/client.js';
-import { readLeaderboard } from '../services/leaderboard.service.js';
+import { encodeDetail, readLeaderboard, scoreOf } from '../services/leaderboard.service.js';
 
 /**
  * Real-time P&L hook.
@@ -14,7 +14,8 @@ import { readLeaderboard } from '../services/leaderboard.service.js';
  * the moment its transaction commits, is reported straight to the leaderboard
  * store in Redis:
  *
- *   lb:<competition>       the trader's score is set to their equity after the fill
+ *   lb:<competition>       the trader's score is set to their return after the fill
+ *                          (equity against the money they started with)
  *   fills:<competition>    a capped stream of every fill (who, what, how many, at
  *                          what price, equity afterwards) for anything that wants
  *                          to follow the competition trade by trade
@@ -59,8 +60,8 @@ async function onOrder(event: OrderEvent): Promise<void> {
   const { order, fill, competitionId } = event;
   await redis
     .multi()
-    .zadd(keys.leaderboard(competitionId), fill.equity, trader.traderId)
-    .hset(keys.leaderboardNames(competitionId), trader.traderId, trader.displayName)
+    .zadd(keys.leaderboard(competitionId), scoreOf(fill.equity, fill.startingBalance), trader.traderId)
+    .hset(keys.leaderboardNames(competitionId), trader.traderId, encodeDetail(trader.displayName, fill.equity, fill.startingBalance))
     .xadd(
       keys.fills(competitionId),
       'MAXLEN',

@@ -277,8 +277,15 @@ async function main(): Promise<void> {
   await bot.waitFor((m) => m.op === 'exec' && m.clOrdId === `ws-${run}-5` && m.execType === 'FILL');
   await sleep(150);
   const score = await redis.zscore(`lb:${sandboxA}`, ack.traderId);
+  const detail = JSON.parse((await redis.hget(`lb:${sandboxA}:names`, ack.traderId)) ?? '{}');
   const liveAccount = (await bot.ask({ op: 'account' })).account;
-  check("each fill sets the bot's leaderboard score in Redis at once", hookBuy?.op === 'order.ack' && score !== null && Math.abs(Number(score) - liveAccount.totalEquity) < 5, { score, equity: liveAccount.totalEquity });
+  // The board ranks by return on the money each started with; equity and starting money are kept beside it.
+  const expected = (liveAccount.totalEquity - liveAccount.startingBalance) / liveAccount.startingBalance;
+  check(
+    "each fill sets the bot's leaderboard standing in Redis at once",
+    hookBuy?.op === 'order.ack' && score !== null && Math.abs(Number(score) - expected) < 1e-4 && Math.abs(detail.e - liveAccount.totalEquity) < 5 && detail.s === liveAccount.startingBalance,
+    { score, expected, detail, equity: liveAccount.totalEquity },
+  );
   const stream = await redis.xrevrange(`fills:${sandboxA}`, '+', '-', 'COUNT', 1);
   const lastFill = Object.fromEntries((stream[0]?.[1] ?? []).reduce<string[][]>((pairs, value, i, all) => (i % 2 === 0 ? [...pairs, [value, all[i + 1]!]] : pairs), []));
   check('each fill is appended to the competition fill stream with its price', lastFill.symbol === 'MSFT' && lastFill.traderId === ack.traderId && Number(lastFill.quantity) === 20 && Number(lastFill.price) > 0, lastFill);

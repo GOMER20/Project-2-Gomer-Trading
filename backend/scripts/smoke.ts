@@ -338,11 +338,21 @@ async function main(): Promise<void> {
     );
     for (const id of stopIds) if (id && id !== fired?.id) await api('DELETE', `/api/orders/${id}`, a);
 
-    const q2 = feed.latestQuote('TSLA');
-    const stopAt = Math.round((q2.ask + 0.2) * 100) / 100;
-    const limitAt = Math.round((stopAt + 0.5) * 100) / 100;
-    const stopLimit = await order(a, { ticker: 'TSLA', side: 'BUY', type: 'STOP_LIMIT', quantity: 5, stopPrice: stopAt, limitPrice: limitAt });
-    const sellSide = await order(a, { ticker: 'TSLA', side: 'SELL', type: 'STOP_LIMIT', quantity: 5, stopPrice: Math.round((q2.bid - 0.2) * 100) / 100, limitPrice: Math.round((q2.bid - 0.7) * 100) / 100 });
+    // Close to the market so one of them fires within the minute. If the price jumps past a stop in the
+    // moment before the order arrives, the exchange rightly refuses it; then try again from the new price.
+    const placeStopLimit = async (side: 'BUY' | 'SELL') => {
+      let placed: Awaited<ReturnType<typeof order>> | null = null;
+      for (let attempt = 0; attempt < 5 && !placed?.body.order; attempt++) {
+        const q = feed.latestQuote('TSLA');
+        const stopPrice = Math.round((side === 'BUY' ? q.ask + 0.2 : q.bid - 0.2) * 100) / 100;
+        const limitPrice = Math.round((side === 'BUY' ? stopPrice + 0.5 : stopPrice - 0.5) * 100) / 100;
+        placed = await order(a, { ticker: 'TSLA', side, type: 'STOP_LIMIT', quantity: 5, stopPrice, limitPrice });
+        if (!placed.body.order && !/stop must be/.test(placed.body.error?.message ?? '')) break;
+      }
+      return placed!;
+    };
+    const stopLimit = await placeStopLimit('BUY');
+    const sellSide = await placeStopLimit('SELL');
     const slIds = [stopLimit.body.order?.id, sellSide.body.order?.id];
     check('stop-limit orders are accepted on both sides', slIds.every(Boolean), [stopLimit.body, sellSide.body]);
     const slFired = (await feed.waitFor((m) => m.type === 'order' && slIds.includes(m.data.id) && m.data.status === 'FILLED', 60_000))?.data;
@@ -742,6 +752,25 @@ async function main(): Promise<void> {
   const lowered = await api('PUT', `/api/competitions/${richId}/balance`, admin, { startingBalance: 900_000 });
   const loweredA = (await api('GET', `/api/portfolios/${richId}`, a)).body.portfolio;
   check('it can be lowered again, and cash falls by the difference', lowered.status === 200 && near(loweredA.cash, afterA.cash - 100_000, 0.011), { lowered: lowered.body, cash: loweredA.cash });
+
+  // One account only: more money for A, nobody else touched, and no head start on the board.
+  const beforeB = (await api('GET', `/api/portfolios/${richId}`, b)).body.portfolio;
+  check('a trader cannot change one account\'s money either (403)', (await api('PUT', `/api/accounts/${loweredA.id}/balance`, b, { startingBalance: 9_000_000 })).status === 403);
+  const funded = await api('PUT', `/api/accounts/${loweredA.id}/balance`, admin, { startingBalance: 5_000_000 });
+  const fundedA = (await api('GET', `/api/portfolios/${richId}`, a)).body.portfolio;
+  const untouchedB = (await api('GET', `/api/portfolios/${richId}`, b)).body.portfolio;
+  check('one account can be given its own starting money', funded.status === 200 && funded.body.previous === 900_000 && funded.body.startingBalance === 5_000_000 && funded.body.competitionStartingBalance === 900_000, funded.body);
+  check("its cash moves by the difference and its profit and loss are kept", near(fundedA.cash, loweredA.cash + 4_100_000, 0.011) && fundedA.startingBalance === 5_000_000 && Math.abs(fundedA.totalPnl - loweredA.totalPnl) < 50, { before: loweredA, after: fundedA });
+  check('nobody else in the competition changes', near(untouchedB.cash, beforeB.cash) && untouchedB.startingBalance === 900_000, untouchedB);
+  const standings = (await api('GET', `/api/competitions/${richId}/results`, admin)).body.standings ?? [];
+  const rowA = standings.find((row: any) => row.traderId === traderA);
+  check('results measure each account from its own starting money', rowA?.startingBalance === 5_000_000 && Math.abs(rowA.pnl - (rowA.equity - 5_000_000)) < 0.011, rowA);
+  check('and rank by return, not by who has the most money', standings.length === 2 && standings[0].returnPct >= standings[1].returnPct, standings.map((row: any) => [row.traderId, row.equity, row.returnPct]));
+  const whole = await api('PUT', `/api/competitions/${richId}/balance`, admin, { startingBalance: 1_000_000 });
+  const afterWholeA = (await api('GET', `/api/portfolios/${richId}`, a)).body.portfolio;
+  const afterWholeB = (await api('GET', `/api/portfolios/${richId}`, b)).body.portfolio;
+  check("changing the whole competition afterwards keeps the one account's extra money", whole.status === 200 && afterWholeA.startingBalance === 5_100_000 && afterWholeB.startingBalance === 1_000_000, { a: afterWholeA.startingBalance, b: afterWholeB.startingBalance });
+  check('an account cannot be lowered below what it has already spent', (await api('PUT', `/api/accounts/${loweredA.id}/balance`, admin, { startingBalance: 1_000 })).status === 409);
 
   feed.close();
   console.log(`\n${failed === 0 ? '\x1b[32m' : '\x1b[31m'}${passed} passed, ${failed} failed\x1b[0m`);

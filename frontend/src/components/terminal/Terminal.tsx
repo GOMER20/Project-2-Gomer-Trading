@@ -14,6 +14,7 @@ import { useUiStore } from '@/store/ui';
 import { Blotter } from './Blotter';
 import { ChartPanel } from './ChartPanel';
 import { DepthLadder } from './DepthLadder';
+import { PriceAlertWatcher, useAlertSymbols } from './Alerts';
 import { Leaderboard } from './Leaderboard';
 import { ResultsDialog, winnerNames } from './ResultsDialog';
 import { Tape } from './Tape';
@@ -146,13 +147,16 @@ export function Terminal() {
     };
   }, [activeId]);
 
-  const streamed = [...new Set([...watchlist, symbol, ...(positions?.map((p) => p.ticker) ?? [])])];
+  const alertSymbols = useAlertSymbols();
+  // Quotes keep coming for everything on screen, everything held, and everything with a price alert waiting.
+  const streamed = [...new Set([...watchlist, symbol, ...(positions?.map((p) => p.ticker) ?? []), ...alertSymbols])];
 
   return (
     <div className="flex min-h-dvh flex-col bg-surface lg:h-dvh lg:min-h-[640px]">
       {streamed.map((s) => (
         <Subscription key={s} symbol={s} />
       ))}
+      <PriceAlertWatcher />
       <TopBar competition={competition} />
 
       {loadError ? (

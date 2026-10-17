@@ -79,7 +79,7 @@ export interface AtFill {
 export interface AtAccount {
   portfolioId: string;
   traderId: string;
-  competition: { id: string; name: string; startDate: string; endDate: string; status: 'UPCOMING' | 'ACTIVE' | 'ENDED' };
+  competition: { id: string; name: string; startDate: string; endDate: string; status: 'UPCOMING' | 'ACTIVE' | 'ENDED'; startingBalance: number };
   /** The API keys pinned to this competition now. None: AT used to trade here. */
   keys: Array<{ id: string; label: string; enabled: boolean; lastUsedAt: string | null }>;
   connection: { connected: boolean; connections: number; transports: string[]; since: string | null; ordersThisConnection: number };
@@ -279,6 +279,7 @@ interface AccountRow {
   competition_name: string;
   start_date: Date;
   end_date: Date;
+  starting_balance: string;
 }
 
 interface KeyRow {
@@ -323,6 +324,7 @@ async function account(row: AccountRow, keys: KeyRow[], brief: boolean): Promise
       startDate: row.start_date.toISOString(),
       endDate: row.end_date.toISOString(),
       status: now < row.start_date ? 'UPCOMING' : now > row.end_date ? 'ENDED' : 'ACTIVE',
+      startingBalance: Number(row.starting_balance),
     },
     keys: keys.map((key) => ({ id: key.id, label: key.label, enabled: key.enabled, lastUsedAt: key.last_used_at?.toISOString() ?? null })),
     connection: {
@@ -444,7 +446,7 @@ export async function getAtDashboard(brief = false): Promise<AtDashboard> {
   if (userIds.length) {
     // Every account AT has, including competitions it has since been moved out of.
     const { rows } = await pool.query<AccountRow>(
-      `SELECT p.id AS portfolio_id, p.user_id, u.trader_id, c.id AS competition_id, c.name AS competition_name, c.start_date, c.end_date
+      `SELECT p.id AS portfolio_id, p.user_id, u.trader_id, c.id AS competition_id, c.name AS competition_name, c.start_date, c.end_date, c.starting_balance
          FROM portfolios p
          JOIN users u ON u.id = p.user_id
          JOIN competitions c ON c.id = p.competition_id

@@ -113,7 +113,7 @@ export function ResultsDialog({ competitionId, onClose }: { competitionId: strin
         <p className="shrink-0 border-t border-line px-4 py-2 text-[10px] text-faint">
           {final
             ? 'When the competition ended every open position was closed at the final price, so these results are settled and will not change.'
-            : 'Equity is updated every ten seconds. The winner is the trader with the highest equity when the competition ends.'}
+            : 'Equity is updated every ten seconds. The winner is the trader with the highest return when the competition ends: profit as a share of the money they started with.'}
         </p>
       </div>
     </div>

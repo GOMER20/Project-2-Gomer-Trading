@@ -59,6 +59,10 @@ export interface Competition {
   commissionPerShare: number;
   /** Margin call level as a fraction; zero means margin calls are off. */
   maintenanceMargin: number;
+  /** standard: fills from the modelled book. hft: the realistic sandbox, where HFT decides them. */
+  fillModel: 'standard' | 'hft';
+  /** With fill model hft: milliseconds an order or cancel takes to reach the book. */
+  orderDelayMs: number;
   status: CompetitionStatus;
   /** True once an ended competition has been settled: positions closed, standings final. */
   final: boolean;
@@ -171,6 +175,8 @@ export interface LeaderboardEntry {
   traderId: string;
   displayName: string;
   equity: number;
+  /** What this trader started with (an account can be given more money than the rest). */
+  startingBalance?: number;
   pnl: number;
   returnPct: number;
 }
@@ -203,6 +209,7 @@ export interface Standing {
   traderId: string;
   displayName: string;
   equity: number;
+  startingBalance?: number;
   pnl: number;
   returnPct: number;
   realizedPnl: number;

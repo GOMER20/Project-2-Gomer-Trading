@@ -23,6 +23,8 @@ export interface DesktopBridge {
   openHosting(): void;
   /** Opens (or brings forward) the AT or HFT window. Missing in app versions from before those windows. */
   openWindow?(name: 'at' | 'hft'): void;
+  /** Shows a system notification. Missing in app versions from before alerts. */
+  notify?(title: string, body: string): void;
 }
 
 declare global {

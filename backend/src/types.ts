@@ -66,6 +66,8 @@ export interface CompetitionRow {
   join_code: string | null;
   commission_per_share: string;
   maintenance_margin: string;
+  fill_model: 'standard' | 'hft';
+  order_delay_ms: number;
   created_at: Date;
 }
 

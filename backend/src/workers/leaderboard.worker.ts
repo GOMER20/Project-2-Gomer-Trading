@@ -33,6 +33,8 @@ const INSTANCE_ID = randomUUID();
 interface PortfolioRow {
   id: string;
   cash: string;
+  /** Money given to this account alone, on top of the competition's starting money. */
+  funding: string;
   trader_id: string;
   display_name: string;
 }
@@ -65,7 +67,7 @@ async function loadMarks(tickers: string[]): Promise<Map<string, Decimal>> {
 
 async function updateCompetition(competition: CompetitionRow): Promise<number> {
   const portfolios = await pool.query<PortfolioRow>(
-    `SELECT p.id, p.cash, u.trader_id, u.display_name
+    `SELECT p.id, p.cash, p.funding, u.trader_id, u.display_name
        FROM portfolios p
        JOIN users u ON u.id = p.user_id
       WHERE p.competition_id = $1`,
@@ -104,7 +106,12 @@ async function updateCompetition(competition: CompetitionRow): Promise<number> {
     ids.push(portfolio.id);
     equities.push(valuation.equity.toFixed(4));
     buyingPowers.push(valuation.buyingPower.toFixed(4));
-    return { traderId: portfolio.trader_id, displayName: portfolio.display_name, equity: valuation.equity.toDecimalPlaces(2).toNumber() };
+    return {
+      traderId: portfolio.trader_id,
+      displayName: portfolio.display_name,
+      equity: valuation.equity.toDecimalPlaces(2).toNumber(),
+      startingBalance: Number(competition.starting_balance) + Number(portfolio.funding),
+    };
   });
 
   if (ids.length > 0) {
@@ -126,14 +133,19 @@ async function updateCompetition(competition: CompetitionRow): Promise<number> {
 
 /** Publishes the standings of a competition that has ended, exactly as the engine recorded them. */
 async function publishFinal(competition: CompetitionRow): Promise<number> {
-  const { rows } = await pool.query<{ trader_id: string; display_name: string; total_equity: string }>(
-    `SELECT u.trader_id, u.display_name, p.total_equity
+  const { rows } = await pool.query<{ trader_id: string; display_name: string; total_equity: string; funding: string }>(
+    `SELECT u.trader_id, u.display_name, p.total_equity, p.funding
        FROM portfolios p
        JOIN users u ON u.id = p.user_id
       WHERE p.competition_id = $1`,
     [competition.id],
   );
-  const standings = rows.map((row) => ({ traderId: row.trader_id, displayName: row.display_name, equity: new Decimal(row.total_equity).toDecimalPlaces(2).toNumber() }));
+  const standings = rows.map((row) => ({
+    traderId: row.trader_id,
+    displayName: row.display_name,
+    equity: new Decimal(row.total_equity).toDecimalPlaces(2).toNumber(),
+    startingBalance: Number(competition.starting_balance) + Number(row.funding),
+  }));
   await writeLeaderboard(competition.id, Number(competition.starting_balance), standings);
   const board = await readLeaderboard(competition.id, config.leaderboard.size);
   if (board) await redis.publish(keys.leaderboardChannel, JSON.stringify(board));

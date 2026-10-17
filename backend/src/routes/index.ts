@@ -82,7 +82,11 @@ export const apiRouter = Router()
   // algorithm: their windows, for the people the exchange belongs to.
   .get('/hft', requireAuth, requireOwner, hft.status)
   .get('/hft/sessions', requireAuth, requireOwner, hft.sessions)
+  .get('/hft/strategy', requireAuth, requireOwner, hft.strategy)
+  .post('/hft/strategy/kill', requireAuth, requireOwner, hft.killStrategy)
   .get('/at', requireAuth, requireOwner, at.dashboard)
+  // One account's starting money, without touching anyone else in its competition.
+  .put('/accounts/:portfolioId/balance', requireAuth, requireOwner, competitions.setAccountBalance)
   // Trading programs sign in with an API key, not a session.
   .use('/gateway/v1', gatewayRouter)
   .use('/competitions', competitionRoutes)

@@ -15,7 +15,7 @@
 // nothing else) to their network so other people can join from a browser.
 // Everything is stopped again when the app quits.
 
-import { app, BrowserWindow, Menu, Notification, clipboard, dialog, ipcMain, powerSaveBlocker, shell } from 'electron';
+import { app, BrowserWindow, Menu, Notification, clipboard, dialog, ipcMain, powerMonitor, powerSaveBlocker, shell } from 'electron';
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -119,6 +119,8 @@ function loadConfig() {
     practiceHours: 'exchange',
     // Where AT, the trading algorithm, keeps its own folder (its reports are shown in the AT window). Empty: not on this Mac.
     atHome: '',
+    // Keep the Mac from sleeping through US market hours (from just before the open to the close).
+    awakeForMarket: true,
     ...saved,
   };
 
@@ -386,6 +388,8 @@ async function startPlatform() {
     // and order (test mode); its recordings and statistics are kept with the rest of the app's data.
     HFT_BIN: path.join(RESOURCES, 'hft', 'hft'),
     HFT_DIR: path.join(DATA_DIR, 'hft'),
+    HFT_VENUE_DIR: path.join(DATA_DIR, 'hft-venue'),
+    HFT_STRATEGY_DIR: path.join(DATA_DIR, 'hft-strategy'),
     DESKTOP_KEY: config.desktopKey,
     DESKTOP_ADMIN_ID: config.adminId,
     DESKTOP_TRADER_ID: TRADER_ACCOUNT,
@@ -413,9 +417,12 @@ async function startPlatform() {
   platformReady = true;
   apiPort = ports.api;
   // People are connected to this Mac while it hosts: do not let it doze off under them.
-  if (config.hostOnNetwork) keepAwake(true);
+  if (config.hostOnNetwork) keepAwake('hosting', true);
   if (config.shareOnInternet) startTunnel();
   scheduleBackups();
+  pruneUpgradeCopies();
+  watchMarketHours();
+  buildMenu(); // again, now that the settings it shows are loaded
   log('app', `ready at ${origin}${config.hostOnNetwork ? `, hosting at ${networkAddresses().join(', ') || 'no network address'}` : ''}`);
 }
 
@@ -590,6 +597,18 @@ function buildMenu() {
         { type: 'separator' },
         { label: 'Algorithmic Trading (AT)', accelerator: 'CmdOrCtrl+Shift+A', click: () => openLabWindow('at') },
         { label: 'High-Frequency Trading (HFT)', accelerator: 'CmdOrCtrl+Shift+H', click: () => openLabWindow('hft') },
+        { type: 'separator' },
+        {
+          label: 'Keep Mac Awake During US Market Hours',
+          type: 'checkbox',
+          checked: config?.awakeForMarket !== false,
+          click: (item) => {
+            if (!config) return;
+            saveConfig({ ...config, awakeForMarket: item.checked });
+            log('app', `keep awake during market hours: ${item.checked ? 'on' : 'off'}`);
+            void checkMarketHours();
+          },
+        },
       ],
     },
     {
@@ -796,11 +815,113 @@ async function restartApp() {
 // ---------------------------------------------------------------------------
 
 let awakeBlocker = null;
-function keepAwake(on) {
-  if (on && awakeBlocker === null) awakeBlocker = powerSaveBlocker.start('prevent-app-suspension');
-  if (!on && awakeBlocker !== null) {
+/** Why the Mac is being kept awake right now: hosting, sharing, market. It may sleep when there is no reason left. */
+const awakeReasons = new Set();
+function keepAwake(reason, on) {
+  if (on) awakeReasons.add(reason);
+  else awakeReasons.delete(reason);
+  if (awakeReasons.size > 0 && awakeBlocker === null) awakeBlocker = powerSaveBlocker.start('prevent-app-suspension');
+  if (awakeReasons.size === 0 && awakeBlocker !== null) {
     powerSaveBlocker.stop(awakeBlocker);
     awakeBlocker = null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// US market hours: the practice market, AT and HFT all work then, so the Mac
+// is kept awake from just before the open to the close. One thing no app can
+// prevent: with the lid closed on battery, macOS sleeps anyway. So the owner is
+// reminded before the open when on battery, and told afterwards if a session
+// was slept through.
+// ---------------------------------------------------------------------------
+
+/** AT starts itself ten minutes before the open; the Mac is kept awake from a little before that. */
+const MARKET_LEAD_MS = 15 * 60_000;
+const marketWatch = { timer: null, session: null, reminded: null, sleptAt: null, listening: false };
+const localTime = (at) => new Date(at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+
+async function checkMarketHours() {
+  if (quitting || !platformReady || origin === null) return;
+  let hours;
+  try {
+    hours = await (await fetch(`${origin}/api/market/hours`, { signal: AbortSignal.timeout(4000) })).json();
+  } catch {
+    return; // the server is restarting; the next check will do
+  }
+  const now = Date.now();
+  const session = [hours.session, ...(hours.upcoming ?? [])].find((s) => Date.parse(s.closesAt) > now) ?? hours.session;
+  const opens = Date.parse(session.opensAt);
+  const closes = Date.parse(session.closesAt);
+  marketWatch.session = { opens, closes, date: session.date };
+  const want = now >= opens - MARKET_LEAD_MS && now < closes && config.awakeForMarket !== false;
+  if (want !== awakeReasons.has('market')) log('app', want ? 'keeping the Mac awake for the US market session' : 'no longer keeping the Mac awake for the market');
+  keepAwake('market', want);
+
+  // The one case the app cannot handle on its own: say so while there is still time.
+  if (now >= opens - MARKET_LEAD_MS && now < opens && marketWatch.reminded !== session.date && powerMonitor.isOnBatteryPower()) {
+    marketWatch.reminded = session.date;
+    log('app', 'the market opens soon and the Mac is on battery: reminded the owner');
+    if (Notification.isSupported()) {
+      new Notification({
+        title: `The US market opens at ${localTime(opens)}`,
+        body: 'Your Mac is on battery. Plug it in and keep the lid open: with the lid closed on battery, macOS sleeps whatever any app does, and AT and HFT would miss the session.',
+      }).show();
+    }
+  }
+}
+
+function watchMarketHours() {
+  clearInterval(marketWatch.timer);
+  marketWatch.timer = setInterval(() => void checkMarketHours(), 60_000);
+  marketWatch.timer.unref?.();
+  void checkMarketHours();
+  if (marketWatch.listening) return;
+  marketWatch.listening = true;
+  powerMonitor.on('suspend', () => {
+    marketWatch.sleptAt = Date.now();
+    log('app', 'the Mac is going to sleep');
+  });
+  powerMonitor.on('resume', () => {
+    const slept = marketWatch.sleptAt;
+    marketWatch.sleptAt = null;
+    const now = Date.now();
+    log('app', `the Mac woke up${slept ? ` after ${Math.round((now - slept) / 60_000)} minutes` : ''}`);
+    const session = marketWatch.session;
+    // Asleep during part of a session: everything that should have happened then did not.
+    if (slept && session && slept < session.closes && now > session.opens) {
+      const from = Math.max(slept, session.opens);
+      const to = Math.min(now, session.closes);
+      if (to - from >= 60_000) {
+        log('app', `the Mac slept through the market session from ${localTime(from)} to ${localTime(to)}`);
+        if (Notification.isSupported()) {
+          new Notification({
+            title: 'Your Mac slept during the US market session',
+            body: `From ${localTime(from)} to ${localTime(to)} nothing traded: the practice market paused, and AT and HFT missed that time. Keep the Mac plugged in with the lid open during market hours.`,
+          }).show();
+        }
+      }
+    }
+    void checkMarketHours();
+  });
+}
+
+/** Copies taken before each update are large; the newest three are enough. Older ones go to the Trash, where they can still be recovered. */
+function pruneUpgradeCopies() {
+  let copies;
+  try {
+    copies = fs
+      .readdirSync(BACKUP_DIR)
+      .filter((name) => /^before-upgrade-.*\.tgz$/.test(name))
+      .map((name) => ({ file: path.join(BACKUP_DIR, name), at: fs.statSync(path.join(BACKUP_DIR, name)).mtimeMs }))
+      .sort((a, b) => b.at - a.at);
+  } catch {
+    return; // no backups folder yet
+  }
+  for (const old of copies.slice(3)) {
+    shell
+      .trashItem(old.file)
+      .then(() => log('backup', `moved an older pre-update copy to the Trash: ${path.basename(old.file)}`))
+      .catch((err) => log('backup', `could not move ${path.basename(old.file)} to the Trash: ${err.message}`));
   }
 }
 
@@ -898,7 +1019,7 @@ function startQuickTunnel() {
   // While it keeps failing it stays "failed" for the interface, even as another attempt runs.
   if (tunnel.state !== 'failed') tunnel.state = 'starting';
   tunnel.url = null;
-  keepAwake(true);
+  keepAwake('sharing', true);
 
   const child = spawn(CLOUDFLARED, ['tunnel', '--no-autoupdate', '--url', `http://127.0.0.1:${apiPort}`], { stdio: ['ignore', 'pipe', 'pipe'] });
   tunnel.child = child;
@@ -985,7 +1106,7 @@ async function startFixedAddress() {
   tunnel.busy = true;
   if (tunnel.state !== 'failed') tunnel.state = 'starting';
   tunnel.url = null;
-  keepAwake(true);
+  keepAwake('sharing', true);
   try {
     await runTailscaled(current);
     await signInToTailscale(current);
@@ -1098,7 +1219,7 @@ function stopTunnel() {
   child?.kill('SIGTERM');
   daemon?.kill('SIGTERM');
   settleTunnel();
-  if (!config?.hostOnNetwork) keepAwake(false);
+  keepAwake('sharing', false);
 }
 
 /** Resolves when sharing is online, has failed or is waiting for its owner, or after the timeout. */
@@ -1451,6 +1572,14 @@ ipcMain.on('gomer:settings:close', (event) => {
 });
 ipcMain.on('gomer:settings:open-alpaca', (event) => {
   if (fromSettings(event)) void shell.openExternal('https://app.alpaca.markets/');
+});
+// A fill or a price alert, shown as a system notification. Clicking it brings the terminal forward.
+ipcMain.on('gomer:notify', (event, title, body) => {
+  const sender = event.senderFrame?.url ?? '';
+  if (origin === null || !sender.startsWith(`${origin}/`) || !Notification.isSupported()) return;
+  const notification = new Notification({ title: String(title).slice(0, 120), body: String(body).slice(0, 300) });
+  notification.on('click', () => showTerminal());
+  notification.show();
 });
 ipcMain.on('gomer:open-window', (event, name) => {
   const sender = event.senderFrame?.url ?? '';

@@ -97,6 +97,7 @@ export interface AtAccount {
     startDate: string;
     endDate: string;
     status: 'UPCOMING' | 'ACTIVE' | 'ENDED';
+    startingBalance: number;
   };
   keys: Array<{
     id: string;

@@ -4,11 +4,13 @@ import { notFound } from '../lib/errors.js';
 import { competitionStatus, type CompetitionRow, type CompetitionStatus } from '../types.js';
 
 export interface Standing {
-  /** Competition ranking: equal equity shares a rank, and the next rank is skipped. */
+  /** Competition ranking by return: an equal return shares a rank, and the next rank is skipped. */
   rank: number;
   traderId: string;
   displayName: string;
   equity: number;
+  /** What this trader started with: the competition's amount, plus anything given to this account alone. */
+  startingBalance: number;
   pnl: number;
   returnPct: number;
   realizedPnl: number;
@@ -49,6 +51,7 @@ interface Row {
   total_equity: string;
   realized_pnl: string;
   commissions: string;
+  funding: string;
   trades: number;
   wins: number;
   losses: number;
@@ -72,7 +75,7 @@ export async function getResults(competitionId: string): Promise<CompetitionResu
 
   await engine.drained();
   const { rows } = await pool.query<Row>(
-    `SELECT u.trader_id, u.display_name, p.total_equity, p.realized_pnl, p.commissions,
+    `SELECT u.trader_id, u.display_name, p.total_equity, p.realized_pnl, p.commissions, p.funding,
             COALESCE(s.trades, 0)::int AS trades,
             COALESCE(s.wins, 0)::int AS wins,
             COALESCE(s.losses, 0)::int AS losses,
@@ -95,24 +98,28 @@ export async function getResults(competitionId: string): Promise<CompetitionResu
              GROUP BY portfolio_id
        ) s ON s.portfolio_id = p.id
       WHERE p.competition_id = $1
-      ORDER BY p.total_equity DESC, u.trader_id`,
-    [competitionId],
+      -- By return on each account's own starting money: the same order as equity when everyone started equal.
+      ORDER BY (p.total_equity - ($2::numeric + p.funding)) / NULLIF($2::numeric + p.funding, 0) DESC, u.trader_id`,
+    [competitionId, competition.starting_balance],
   );
 
   const startingBalance = Number(competition.starting_balance);
   const standings: Standing[] = [];
   rows.forEach((row, index) => {
     const equity = round2(Number(row.total_equity));
+    const start = startingBalance + Number(row.funding);
+    const returnPct = round2(((equity - start) / start) * 100);
     const previous = standings[index - 1];
     const closed = row.wins + row.losses;
     const grossLoss = Number(row.gross_loss);
     standings.push({
-      rank: previous && previous.equity === equity ? previous.rank : index + 1,
+      rank: previous && previous.returnPct === returnPct ? previous.rank : index + 1,
       traderId: row.trader_id,
       displayName: row.display_name,
       equity,
-      pnl: round2(equity - startingBalance),
-      returnPct: round2(((equity - startingBalance) / startingBalance) * 100),
+      startingBalance: start,
+      pnl: round2(equity - start),
+      returnPct,
       realizedPnl: round2(Number(row.realized_pnl)),
       commissions: round2(Number(row.commissions)),
       trades: row.trades,

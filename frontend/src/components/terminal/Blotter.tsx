@@ -10,8 +10,9 @@ import { useAuthStore } from '@/store/auth';
 import { exitKind, ORDER_TYPE_NAMES, useTradingStore } from '@/store/trading';
 import { useUiStore } from '@/store/ui';
 import { EmptyState } from '../ui/Panel';
+import { AlertsPanel, useAlertSymbols } from './Alerts';
 
-type Tab = 'positions' | 'working' | 'history' | 'fills' | 'performance';
+type Tab = 'positions' | 'working' | 'history' | 'fills' | 'performance' | 'alerts';
 
 const th = 'whitespace-nowrap px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-faint';
 const td = 'num whitespace-nowrap px-2 py-1.5 text-xs';
@@ -352,6 +353,7 @@ export function Blotter({ competition }: { competition: Competition | undefined 
   const positionCount = useTradingStore((s) => s.portfolio?.positions.length ?? 0);
   const orders = useTradingStore((s) => s.orders);
   const working = orders.filter((o) => o.status === 'OPEN');
+  const alertCount = useAlertSymbols().length;
 
   const tabs: Array<{ id: Tab; label: string; count?: number }> = [
     { id: 'positions', label: 'Positions', count: positionCount },
@@ -359,6 +361,7 @@ export function Blotter({ competition }: { competition: Competition | undefined 
     { id: 'history', label: 'Order history' },
     { id: 'fills', label: 'Fills' },
     { id: 'performance', label: 'Performance' },
+    { id: 'alerts', label: 'Alerts', count: alertCount },
   ];
 
   return (
@@ -391,6 +394,7 @@ export function Blotter({ competition }: { competition: Competition | undefined 
         {tab === 'history' ? <OrdersTable orders={orders} empty="No orders yet in this competition." /> : null}
         {tab === 'fills' ? <FillsTable competition={competition} /> : null}
         {tab === 'performance' ? <Performance competition={competition} /> : null}
+        {tab === 'alerts' ? <AlertsPanel /> : null}
       </div>
     </section>
   );

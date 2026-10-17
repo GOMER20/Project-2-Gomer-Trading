@@ -9,4 +9,5 @@ contextBridge.exposeInMainWorld('gomerDesktop', {
   hosting: () => ipcRenderer.invoke('gomer:hosting'),
   openHosting: () => ipcRenderer.send('gomer:open-hosting'),
   openWindow: (name) => ipcRenderer.send('gomer:open-window', name),
+  notify: (title, body) => ipcRenderer.send('gomer:notify', String(title ?? ''), String(body ?? '')),
 });

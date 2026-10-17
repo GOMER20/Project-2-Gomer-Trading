@@ -364,13 +364,23 @@ export function AtWindow() {
           ) : null}
 
           {account.competition.status !== 'ENDED' && account.portfolio ? (
-            // More money for AT: changes every account in this competition (in AT's own sandbox, only AT's).
-            <div className="rounded-sm border border-line bg-panel px-3 py-2">
+            // More money for AT: its own account only, or everyone in the competition.
+            <div className="flex flex-wrap items-start gap-x-8 gap-y-2 rounded-sm border border-line bg-panel px-3 py-2">
               <StartingMoney
-                key={account.portfolioId}
+                key={`${account.portfolioId}-own`}
+                label="AT's starting money"
                 competitionId={account.competition.id}
                 competitionName={account.competition.name}
                 current={account.portfolio.startingBalance}
+                account={{ portfolioId: account.portfolioId, name: 'AT' }}
+                onChanged={reload}
+              />
+              <StartingMoney
+                key={`${account.portfolioId}-all`}
+                label="Whole competition"
+                competitionId={account.competition.id}
+                competitionName={account.competition.name}
+                current={account.competition.startingBalance}
                 onChanged={reload}
               />
             </div>

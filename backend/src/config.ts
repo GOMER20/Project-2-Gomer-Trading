@@ -58,6 +58,13 @@ const schema = z.object({
   // sessions' recordings are kept, so its folder never holds more than the two multiplied together.
   HFT_RECORD_LIMIT_MB: z.coerce.number().int().min(1).max(100_000).default(250),
   HFT_KEEP_SESSIONS: z.coerce.number().int().min(1).max(100).default(2),
+  // The realistic sandbox: each competition whose fill model is hft is matched in an HFT of its own,
+  // in a folder under HFT_VENUE_DIR, each with this disk budget (recording cap times sessions kept).
+  HFT_VENUE_DIR: z.string().optional(),
+  HFT_VENUE_RECORD_LIMIT_MB: z.coerce.number().int().min(1).max(100_000).default(100),
+  HFT_VENUE_KEEP_SESSIONS: z.coerce.number().int().min(1).max(100).default(2),
+  // Where HFT Strategy, the market-making program in Project 1, keeps its status, reports and tick data.
+  HFT_STRATEGY_DIR: z.string().optional(),
   // AT, the trading algorithm (a separate project) that trades here through the bot gateway. Its
   // windows find it by the label its API keys carry; AT_HOME is its own folder, whose reports
   // (runs/ and reports/) are shown beside what it traded here. Empty = not on this machine.
@@ -142,6 +149,12 @@ export const config = {
     dataDir: env.HFT_DIR || path.join(REPO_ROOT, '.data', 'hft'),
     recordLimitMb: env.HFT_RECORD_LIMIT_MB,
     keepSessions: env.HFT_KEEP_SESSIONS,
+    venue: {
+      dataDir: env.HFT_VENUE_DIR || path.join(REPO_ROOT, '.data', 'hft-venue'),
+      recordLimitMb: env.HFT_VENUE_RECORD_LIMIT_MB,
+      keepSessions: env.HFT_VENUE_KEEP_SESSIONS,
+    },
+    strategyDir: env.HFT_STRATEGY_DIR || path.join(REPO_ROOT, '.data', 'hft-strategy'),
   },
   desktop: { key: env.DESKTOP_KEY, accounts: { admin: env.DESKTOP_ADMIN_ID, trader: env.DESKTOP_TRADER_ID } },
   at: { label: env.AT_LABEL, home: env.AT_HOME },

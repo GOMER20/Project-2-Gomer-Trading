@@ -7,6 +7,7 @@ import { AppError, conflict, notFound, orderRejected } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { averagePrice, provideLiquidity, sharesIn, takeLiquidity, type DepthBook, type Piece } from '../market/depth.js';
 import { market, type MarketDataService } from '../market/marketData.js';
+import type { VenueHandlers, VenueOrder } from '../hft/hftVenue.js';
 import { toOrderDto, type OrderDto, type OrderRow, type OrderSide, type OrderType, type Quote, type TimeInForce } from '../types.js';
 import { assertCompetitionOpen } from './account.js';
 import { applyFill, reducibleShares, valuePortfolio, type PositionState } from './accounting.js';
@@ -33,12 +34,26 @@ export interface NewOrder {
   clientOrderId?: string | null;
 }
 
+/** Where a realistic competition's orders are matched: HFT (hft/hftVenue.ts). */
+export interface FillVenue {
+  submit(order: VenueOrder, delayMs: number): void;
+  cancel(orderId: string, delayMs: number): void;
+  forget(orderId: string): void;
+  has(orderId: string): boolean;
+}
+
+export interface FillVenues {
+  /** The venue for a competition, or null if none can be had. */
+  for(competitionId: string): FillVenue | null;
+  bind(handlers: (competitionId: string) => VenueHandlers): void;
+}
+
 export interface OrderEvent {
   userId: string;
   competitionId: string;
   order: OrderDto;
   /** Present when shares traded in the step this event reports: how many, at what average price, and the account's equity afterwards. */
-  fill?: { quantity: number; price: number; equity: number };
+  fill?: { quantity: number; price: number; equity: number; startingBalance: number };
 }
 
 interface RestingOrder {
@@ -115,6 +130,11 @@ const RECONCILE_MS = 30_000;
  *    their working orders are cancelled and their positions closed at market.
  *  - When a competition ends, its working orders are cancelled and every
  *    position is closed at the final price, so each result is plain cash.
+ *  - A competition whose fill model is "hft" is the realistic sandbox: its
+ *    orders are checked and booked here as any other, but matched in HFT
+ *    (hft/hftVenue.ts), where they wait in line behind the market's own and
+ *    reach the book after a delay. Only stop orders waiting for their price
+ *    rest here. Fills and endings come back through the venue's handlers.
  *
  * Because one thread does all of this, two orders can never both spend the
  * same buying power: there is no moment between checking an account and
@@ -133,10 +153,23 @@ export class MatchingEngine extends EventEmitter<{ order: [OrderEvent] }> {
   /** When each symbol last traded, to tell a market that has just reopened from one that is simply ticking. */
   private readonly lastQuoteAt = new Map<string, number>();
   private readonly quoteListener = (quote: Quote) => this.onQuote(quote);
+  private venues: FillVenues | null = null;
   private readonly markOf = (ticker: string) => this.market.getMark(ticker);
 
   constructor(private readonly market: MarketDataService) {
     super();
+  }
+
+  /**
+   * Where realistic competitions are matched. Set before start(), so that
+   * their working orders go back to their venue when the engine starts.
+   */
+  useVenues(venues: FillVenues): void {
+    this.venues = venues;
+    venues.bind(() => ({
+      fill: (orderId, price, quantity) => this.venueFill(orderId, price, quantity),
+      ended: (orderId, why) => this.venueEnded(orderId, why),
+    }));
   }
 
   /** Brings the database up to date with the journal, loads every account the market can act on, and starts listening to quotes. */
@@ -167,7 +200,8 @@ export class MatchingEngine extends EventEmitter<{ order: [OrderEvent] }> {
     for (const account of this.ledger.all()) {
       for (const ticker of account.positions.keys()) tickers.add(ticker);
       for (const order of account.working.values()) {
-        this.rest(order, false); // the market may have moved while nothing was watching
+        if (this.byVenue(account) && !waitingForStop(order)) this.toVenue(account, order);
+        else this.rest(order, false); // the market may have moved while nothing was watching
         tickers.add(order.ticker);
         resting++;
       }
@@ -246,6 +280,7 @@ export class MatchingEngine extends EventEmitter<{ order: [OrderEvent] }> {
     if (!quote || !depth) throw orderRejected(`No live quote is available for ${input.ticker}.`);
 
     const fresh = this.market.tradable(quote);
+    const viaVenue = this.byVenue(account);
     const slippage = config.trading.slippagePerShare;
     const limit = input.limitPrice === null ? null : new Decimal(input.limitPrice);
     const stop = input.stopPrice === null ? null : new Decimal(input.stopPrice);
@@ -267,22 +302,25 @@ export class MatchingEngine extends EventEmitter<{ order: [OrderEvent] }> {
       riskPrice = limit ?? (input.side === 'BUY' ? stop.plus(slippage) : stop);
     } else if (limit !== null) {
       // Never trade against a stale quote or a closed market; the order rests until the market ticks again.
-      if (fresh) pieces = takeLiquidity(input.side, input.quantity, limit, depth, slippage);
+      if (fresh && !viaVenue) pieces = takeLiquidity(input.side, input.quantity, limit, depth, slippage);
       riskPrice = limit;
     } else {
       if (!fresh) throw orderRejected(this.market.whyNotTradable(input.ticker));
       const touch = marketOrderPrice(input.side, quote, slippage);
       if (!touch) throw orderRejected(`${input.ticker} has no ${input.side === 'BUY' ? 'offer' : 'bid'} to trade against.`);
-      pieces = takeLiquidity(input.side, input.quantity, null, depth, slippage);
+      const reach = takeLiquidity(input.side, input.quantity, null, depth, slippage);
       // The whole order is checked at the worst price it reaches now; a part that has to wait is checked again when it trades.
-      riskPrice = pieces.at(-1)?.price ?? touch;
+      riskPrice = reach.at(-1)?.price ?? touch;
+      // In the realistic sandbox HFT does the trading; here it is only measured.
+      if (!viaVenue) pieces = reach;
     }
 
     const timeInForce = input.timeInForce ?? 'GTC';
     if (timeInForce !== 'GTC') {
       if (stop !== null) throw orderRejected('Immediate-or-cancel and fill-or-kill apply to market and limit orders, not to stops.');
       const available = sharesIn(pieces);
-      if (timeInForce === 'FOK' && available < input.quantity) {
+      // HFT decides a realistic sandbox's fill-or-kill orders for itself.
+      if (timeInForce === 'FOK' && !viaVenue && available < input.quantity) {
         throw orderRejected(`Fill-or-kill: only ${available} of ${input.quantity} shares can trade at once${limit ? ' within the limit' : ''}, so nothing was done.`);
       }
     }
@@ -336,7 +374,7 @@ export class MatchingEngine extends EventEmitter<{ order: [OrderEvent] }> {
     const step = new Step(account);
     step.touch(order);
     if (pieces.length) this.execute(step, order, pieces);
-    if (timeInForce === 'IOC' && order.status === 'OPEN') {
+    if (timeInForce === 'IOC' && order.status === 'OPEN' && !viaVenue) {
       // Immediate-or-cancel: whatever the book did not give at once is cancelled, never left resting.
       order.status = 'CANCELLED';
       order.reject_reason = 'Immediate-or-cancel: the unfilled part was cancelled';
@@ -349,6 +387,13 @@ export class MatchingEngine extends EventEmitter<{ order: [OrderEvent] }> {
     const account = this.ledger.ownerOf(orderId);
     const order = account?.working.get(orderId);
     if (account && order && account.userId === userId && order.status === 'OPEN') {
+      const venue = this.byVenue(account) && !waitingForStop(order) ? this.venueOf(account) : null;
+      if (venue?.has(order.id)) {
+        // It is in HFT's book: the cancel takes its time to get there, and the order may fill first.
+        // The cancellation is reported when HFT confirms it.
+        venue.cancel(order.id, account.rules.orderDelayMs);
+        return toOrderDto(order);
+      }
       order.status = 'CANCELLED';
       const step = new Step(account);
       step.touch(order);
@@ -442,6 +487,14 @@ export class MatchingEngine extends EventEmitter<{ order: [OrderEvent] }> {
 
     const limit = order.limit_price === null ? null : new Decimal(order.limit_price);
     const waking = order.stop_price !== null && order.triggered_at === null;
+    if (this.byVenue(account)) {
+      // A stop whose price has been reached becomes a market or limit order, and goes to HFT (finish()).
+      if (waking) {
+        order.triggered_at = new Date();
+        step.touch(order);
+      }
+      return this.finish(step);
+    }
     // Whatever is left after this has stood in a trading market.
     const maker = resting.seated;
     resting.seated = true;
@@ -598,8 +651,9 @@ export class MatchingEngine extends EventEmitter<{ order: [OrderEvent] }> {
     const accounts = (await Promise.all(portfolios.map((portfolio) => this.ledger.load(portfolio.id)))).filter((account): account is LiveAccount => account !== null);
 
     // From here to the journal entry nothing is awaited, so no order can come in between.
-    // Memory is ahead of the database, so the amount the accounts started with is read from them.
-    const previous = accounts[0]?.startingBalance ?? new Decimal(competition.starting_balance);
+    // Memory is ahead of the database, so the competition's amount is read from its accounts
+    // (each has its own funding on top, which this leaves as it is).
+    const previous = accounts[0] ? accounts[0].startingBalance.minus(accounts[0].funding) : new Decimal(competition.starting_balance);
     const difference = amount.minus(previous);
     const poorest = accounts.reduce<LiveAccount | null>((low, account) => (!low || account.cash.lt(low.cash) ? account : low), null);
     if (poorest && poorest.cash.plus(difference).lt(0)) {
@@ -609,7 +663,7 @@ export class MatchingEngine extends EventEmitter<{ order: [OrderEvent] }> {
 
     for (const account of accounts) {
       account.cash = account.cash.plus(difference);
-      account.startingBalance = amount;
+      account.startingBalance = amount.plus(account.funding);
     }
     try {
       this.store.append({
@@ -638,6 +692,54 @@ export class MatchingEngine extends EventEmitter<{ order: [OrderEvent] }> {
   }
 
   /**
+   * Gives one account a different amount to start with, without touching
+   * anyone else in its competition (more money for a trading program, say).
+   * Its cash moves by the difference, so what it has made or lost so far is
+   * kept, and its return is measured from its own new amount. The leaderboard
+   * ranks by return, so an account with more money has no head start.
+   */
+  async fundAccount(portfolioId: string, amount: Decimal): Promise<{ previous: number; startingBalance: number; competitionStartingBalance: number }> {
+    const account = await this.ledger.load(portfolioId);
+    if (!account) throw notFound('That account does not exist.');
+    if (account.rules.endDate <= new Date()) throw conflict('This competition has ended, so its results are final and its money cannot be changed.');
+
+    // Nothing is awaited from here to the journal entry.
+    const previous = account.startingBalance;
+    const difference = amount.minus(previous);
+    if (account.cash.plus(difference).lt(0)) {
+      const lowest = previous.minus(account.cash).toDecimalPlaces(2, Decimal.ROUND_UP);
+      throw new AppError(409, 'BALANCE_TOO_LOW', `This account has already spent more than that. The least it can start with now is $${lowest.toNumber().toLocaleString('en-US')}.`);
+    }
+    account.cash = account.cash.plus(difference);
+    account.funding = account.funding.plus(difference);
+    account.startingBalance = amount;
+    const valuation = valuePortfolio(account.cash, account.positions, this.markOf, account.rules.leverage);
+    try {
+      this.store.append({
+        orders: [],
+        executions: [],
+        positions: [],
+        portfolios: [
+          {
+            id: account.id,
+            cash: account.cash.toFixed(4),
+            funding: account.funding.toFixed(2),
+            realized_pnl: account.realizedPnl.toFixed(4),
+            commissions: account.commissions.toFixed(4),
+            total_equity: valuation.equity.toFixed(4),
+            buying_power: valuation.buyingPower.toFixed(4),
+          },
+        ],
+      });
+    } catch (err) {
+      logger.fatal({ err }, 'The engine could not write its journal. Restarting from the database.');
+      process.exit(1);
+    }
+    logger.info({ portfolioId, from: previous.toNumber(), to: amount.toNumber() }, 'Account starting money changed');
+    return { previous: previous.toNumber(), startingBalance: amount.toNumber(), competitionStartingBalance: amount.minus(account.funding).toNumber() };
+  }
+
+  /**
    * Makes a decision real: files the orders it touched, journals what
    * changed, and tells the market and the traders. Nothing here waits.
    */
@@ -646,9 +748,14 @@ export class MatchingEngine extends EventEmitter<{ order: [OrderEvent] }> {
     if (step.orders.size === 0 && step.tickers.size === 0 && !step.balances) return;
 
     const valuation = valuePortfolio(account.cash, account.positions, this.markOf, account.rules.leverage);
+    const viaVenue = this.byVenue(account);
     for (const order of step.orders.values()) {
       this.ledger.file(account, order);
-      if (order.status === 'OPEN') this.rest(order);
+      if (viaVenue && !waitingForStop(order)) {
+        this.unrest(order.ticker, order.id);
+        if (order.status === 'OPEN') this.toVenue(account, order);
+        else this.venueOf(account)?.forget(order.id);
+      } else if (order.status === 'OPEN') this.rest(order);
       else this.unrest(order.ticker, order.id);
     }
 
@@ -694,7 +801,7 @@ export class MatchingEngine extends EventEmitter<{ order: [OrderEvent] }> {
         userId: account.userId,
         competitionId: account.competitionId,
         order: toOrderDto(order),
-        ...(fill ? { fill: { quantity: fill.quantity, price: fill.notional.div(fill.quantity).toDecimalPlaces(4).toNumber(), equity } } : {}),
+        ...(fill ? { fill: { quantity: fill.quantity, price: fill.notional.div(fill.quantity).toDecimalPlaces(4).toNumber(), equity, startingBalance: account.startingBalance.toNumber() } } : {}),
       });
     }
   }
@@ -714,27 +821,47 @@ export class MatchingEngine extends EventEmitter<{ order: [OrderEvent] }> {
     const status = marginStatus(account.cash, account.positions, this.markOf, account.rules.maintenanceMargin);
     if (!status.call) return false;
 
+    this.closeAll(account, 'Margin call', 'MARGIN_CALL');
+    logger.warn({ portfolioId: account.id, equity: status.equity.toFixed(2), exposure: status.exposure.toFixed(2) }, 'Margin call: account liquidated');
+    return true;
+  }
+
+  /**
+   * The kill switch, from the Admin console: everything the account has
+   * working is cancelled and every position closed at the market, whether or
+   * not the program trading it is still running.
+   */
+  async closeOut(portfolioId: string, reason: string): Promise<{ cancelled: number; closing: number }> {
+    const account = await this.ledger.load(portfolioId);
+    if (!account) throw notFound('Portfolio not found');
+    return this.closeAll(account, reason, 'KILL_SWITCH');
+  }
+
+  /** Cancels an account's working orders and sends market orders to close every position. */
+  private closeAll(account: LiveAccount, reason: string, forcedBy: string): { cancelled: number; closing: number } {
     const step = new Step(account);
+    let cancelled = 0;
     for (const order of account.working.values()) {
       if (order.status !== 'OPEN') continue;
       order.status = 'CANCELLED';
-      order.reject_reason = 'Margin call';
+      order.reject_reason = reason;
       step.touch(order);
+      cancelled++;
     }
     const slippage = config.trading.slippagePerShare;
+    const closing = account.positions.size;
     for (const [ticker, position] of [...account.positions]) {
       const side: OrderSide = position.quantity > 0 ? 'SELL' : 'BUY';
-      const order = this.blank(account, { ticker, type: 'MARKET', side, quantity: Math.abs(position.quantity), forced_by: 'MARGIN_CALL' });
+      const order = this.blank(account, { ticker, type: 'MARKET', side, quantity: Math.abs(position.quantity), forced_by: forcedBy });
       step.touch(order);
       const quote = this.market.getQuote(ticker);
       const depth = this.market.getDepth(ticker);
-      const pieces = quote && depth && this.market.tradable(quote) ? takeLiquidity(side, order.quantity, null, depth, slippage) : [];
+      const pieces = !this.byVenue(account) && quote && depth && this.market.tradable(quote) ? takeLiquidity(side, order.quantity, null, depth, slippage) : [];
       // What the book cannot take at once keeps working as a market order until the position is gone.
       if (pieces.length) this.execute(step, order, pieces);
     }
     this.finish(step);
-    logger.warn({ portfolioId: account.id, equity: status.equity.toFixed(2), exposure: status.exposure.toFixed(2) }, 'Margin call: account liquidated');
-    return true;
+    return { cancelled, closing };
   }
 
   /** Looks for accounts that have fallen below their maintenance margin and liquidates them. */
@@ -819,13 +946,90 @@ export class MatchingEngine extends EventEmitter<{ order: [OrderEvent] }> {
       const present = new Set(rows.map((row) => row.id));
       for (const account of held) {
         if (present.has(account.id)) continue;
-        for (const order of account.working.values()) this.unrest(order.ticker, order.id);
+        for (const order of account.working.values()) {
+          this.unrest(order.ticker, order.id);
+          if (this.byVenue(account)) this.venueOf(account)?.forget(order.id);
+        }
         this.ledger.evict(account);
         logger.warn({ portfolioId: account.id }, 'An account was deleted from the database; the engine has stopped trading it');
       }
     } catch (err) {
       logger.error({ err }, 'Could not check for deleted accounts');
     }
+  }
+
+  // --- The realistic sandbox ---------------------------------------------------
+
+  /** Whether an account's orders are matched in HFT. */
+  private byVenue(account: LiveAccount): boolean {
+    return account.rules.fillModel === 'hft' && this.venues !== null;
+  }
+
+  private venueOf(account: LiveAccount): FillVenue | null {
+    return this.venues?.for(account.competitionId) ?? null;
+  }
+
+  /** Sends a working order to its competition's venue, unless it is there already. */
+  private toVenue(account: LiveAccount, order: OrderRow): void {
+    const venue = this.venueOf(account);
+    if (!venue) {
+      // More realistic competitions are trading than venues can be run. Nothing can match it.
+      logger.error({ orderId: order.id, competitionId: account.competitionId }, 'No HFT venue for a realistic competition; its order is waiting');
+      return;
+    }
+    if (venue.has(order.id)) return;
+    venue.submit(
+      {
+        id: order.id,
+        ticker: order.ticker,
+        side: order.side,
+        quantity: order.quantity - order.filled_quantity,
+        limit: order.limit_price === null ? null : Number(order.limit_price),
+        timeInForce: order.time_in_force,
+      },
+      account.rules.orderDelayMs,
+    );
+  }
+
+  /** HFT traded some of a sandbox order. The trade has happened, so it is booked whatever the account now holds. */
+  private venueFill(orderId: string, price: number, quantity: number): void {
+    const account = this.ledger.ownerOf(orderId);
+    const order = account?.working.get(orderId);
+    if (!account || !order || order.status !== 'OPEN') {
+      logger.warn({ orderId }, 'HFT filled an order the engine has finished with; the fill is not booked');
+      return;
+    }
+    const shares = Math.min(quantity, order.quantity - order.filled_quantity);
+    if (shares <= 0) return;
+    const step = new Step(account);
+    try {
+      this.execute(step, order, [{ price: new Decimal(price), quantity: shares }]);
+      this.finish(step);
+    } catch (err) {
+      logger.error({ err, orderId }, 'Failed to book a fill from HFT');
+    }
+  }
+
+  /** HFT has finished with a sandbox order that is not filled in full. */
+  private venueEnded(orderId: string, why: 'cancelled' | 'unfilled' | 'refused'): void {
+    const account = this.ledger.ownerOf(orderId);
+    const order = account?.working.get(orderId);
+    if (!account || !order || order.status !== 'OPEN') return;
+    const reasons = {
+      cancelled: null,
+      unfilled:
+        order.time_in_force === 'FOK'
+          ? 'Fill-or-kill: it could not trade in full at once, so nothing was done'
+          : order.limit_price === null
+            ? 'The book could not fill all of it at once; the rest was cancelled'
+            : 'Immediate-or-cancel: the unfilled part was cancelled',
+      refused: 'The realistic sandbox could not take this order: its price is outside the book, or the symbol is not traded there',
+    };
+    order.status = why === 'refused' && order.filled_quantity === 0 ? 'REJECTED' : 'CANCELLED';
+    order.reject_reason = reasons[why];
+    const step = new Step(account);
+    step.touch(order);
+    this.finish(step);
   }
 
   /** A new order for an account, with everything not given left at its starting value. */
@@ -878,5 +1082,8 @@ export class MatchingEngine extends EventEmitter<{ order: [OrderEvent] }> {
     if (orders.size === 0) this.book.delete(ticker);
   }
 }
+
+/** A stop order that has not been reached yet: it waits here, in every kind of competition. */
+const waitingForStop = (order: OrderRow): boolean => order.stop_price !== null && order.triggered_at === null;
 
 export const engine = new MatchingEngine(market);

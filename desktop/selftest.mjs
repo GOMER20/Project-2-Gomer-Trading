@@ -100,10 +100,16 @@ export async function run({ directory, origin, mainWindow, settingsWindow, labWi
     await reachTerminal();
     await waitFor('quotes are streaming', QUOTES_STREAMING);
     await waitFor('portfolio is loaded', `/Cash\\$[\\d,]+\\.\\d{2}/.test(document.querySelector('header').textContent)`);
-    await waitFor('leaderboard is populated', `document.body.textContent.includes('ranked by total equity')`);
+    await waitFor('leaderboard is populated', `document.body.textContent.includes('ranked by return')`);
     await sleep(2500); // let the chart finish drawing
     await capture('terminal.png');
     result.title = await evaluate('document.title');
+
+    // The Alerts tab: the sound and pop-up switches and the price-alert form.
+    await evaluate(`[...document.querySelectorAll('button')].find((b) => b.textContent.trim().startsWith('Alerts')).click()`);
+    await waitFor('the Alerts tab opens with its switches and the price-alert form', `document.body.textContent.includes('Tell me when') && document.body.textContent.includes('Pop-ups')`);
+    await capture('alerts.png');
+    await evaluate(`[...document.querySelectorAll('button')].find((b) => b.textContent.trim().startsWith('Positions')).click()`);
 
     result.cash = await evaluate(`document.querySelector('header').textContent.match(/Cash(\\$[\\d,]+\\.\\d{2})/)?.[1]`);
     if (mode === 'trader') return;
@@ -113,6 +119,8 @@ export async function run({ directory, origin, mainWindow, settingsWindow, labWi
     await evaluate(`document.querySelector('[data-quick-login="admin"]').click()`);
     await waitFor('admin console opens', `location.pathname === '/admin' && document.body.textContent.includes('GOMER TRADING · ADMIN')`);
     await waitFor('admin console lists accounts and competitions', `/Accounts \\(\\d+\\)/.test(document.body.textContent) && document.body.textContent.includes('Demo Trading Challenge')`);
+    // Every amount the money buttons offer must be one the browser accepts, or Save silently does nothing.
+    await waitFor('the starting-money field accepts the one-click amounts', `(() => { const field = document.getElementById('competition-balance'); return [100000, 1000000, 10000000, 100000000].every((amount) => { field.value = String(amount); return field.checkValidity(); }); })()`);
     await sleep(500);
     await capture('admin.png');
     result.accounts = await evaluate(`document.body.textContent.match(/Accounts \\((\\d+)\\)/)?.[1]`);

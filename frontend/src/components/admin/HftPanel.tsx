@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { Fragment, useCallback, useEffect, useState } from 'react';
 import { api, errorMessage } from '@/lib/api';
 import { duration, shares } from '@/lib/format';
 
@@ -71,6 +71,17 @@ interface HftStatus {
   disk: { recordLimitMb: number; keepSessions: number; budgetMb: number; usedMb: number; notRecording: boolean };
 }
 
+/** A realistic sandbox's own HFT, which decides its fills: see backend/src/hft/hftVenue.ts. */
+interface VenueStatus {
+  competitionId: string;
+  state: 'idle' | 'starting' | 'running' | 'down' | 'unavailable';
+  detail: string | null;
+  restarts: number;
+  workingOrders: number;
+  counters: { quotes: number; prints: number; printShares: number; printSharesToTraders: number; orders: number; cancels: number; fills: number; sharesFilled: number; refused: number };
+  disk: { budgetMb: number; usedMb: number };
+}
+
 /** A time in whichever unit reads best: "740 ns", "12.4 µs", "3.1 ms". */
 function span(nanoseconds: number): string {
   if (nanoseconds < 1_000) return `${Math.round(nanoseconds)} ns`;
@@ -107,13 +118,15 @@ function Figure({ title, value, note }: { title: string; value: string; note?: s
 export function HftPanel() {
   const [status, setStatus] = useState<HftStatus | null>(null);
   const [stats, setStats] = useState<HftStats | null>(null);
+  const [venues, setVenues] = useState<VenueStatus[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const reload = useCallback(async () => {
     try {
-      const loaded = await api<{ status: HftStatus; stats: HftStats | null }>('/api/hft');
+      const loaded = await api<{ status: HftStatus; stats: HftStats | null; venues?: VenueStatus[] }>('/api/hft');
       setStatus(loaded.status);
       setStats(loaded.stats);
+      setVenues(loaded.venues ?? []);
       setError(null);
     } catch (err) {
       setError(errorMessage(err));
@@ -216,6 +229,16 @@ export function HftPanel() {
         </dd>
         <dt className="font-sans text-faint">Files</dt>
         <dd className="break-all">{status.dataDir}</dd>
+        {venues.map((venue) => (
+          <Fragment key={venue.competitionId}>
+            <dt className="font-sans text-faint">Realistic sandbox</dt>
+            <dd>
+              <span className="font-sans">{venue.state === 'running' ? 'deciding fills' : venue.state}</span> · {count(venue.workingOrders, 'order')} working · {count(venue.counters.sharesFilled, 'share')} filled in{' '}
+              {count(venue.counters.fills, 'fill')} · {count(venue.counters.prints, 'market trade')} sent to the queue ({count(venue.counters.printSharesToTraders, 'share')} reached traders) · {venue.disk.usedMb} of {venue.disk.budgetMb} MB
+              {venue.detail ? <span className="font-sans text-faint"> ({venue.detail})</span> : null}
+            </dd>
+          </Fragment>
+        ))}
       </dl>
     </div>
   );

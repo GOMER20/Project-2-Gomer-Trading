@@ -2,6 +2,7 @@
 
 import { create } from 'zustand';
 import { api } from '@/lib/api';
+import { signal } from '@/lib/alerts';
 import { price, shares, signedUsd } from '@/lib/format';
 import type { Competition, CompetitionResults, Execution, Leaderboard, NewOrder, Order, Portfolio } from '@/lib/types';
 import { useUiStore } from './ui';
@@ -188,6 +189,9 @@ export const useTradingStore = create<TradingState>((set, get) => ({
     if (previous?.status !== order.status || previous?.triggeredAt !== order.triggeredAt || (firstPiece && previous !== undefined) || liquidation) {
       const toast = describe(order);
       if (toast) get().toast(toast);
+      // Something traded: sound and pop up, as the trader has chosen in the Alerts tab.
+      const traded = order.filledQuantity > (previous?.filledQuantity ?? 0);
+      if (toast && traded) signal('fill', toast.title, toast.detail);
     }
     refreshSoon(competitionId, get().refreshPortfolio);
   },

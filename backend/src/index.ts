@@ -4,7 +4,7 @@ import { config } from './config.js';
 import { pool, waitForDatabase } from './db/pool.js';
 import { engine } from './engine/matchingEngine.js';
 import { startBotGateway } from './gateway/index.js';
-import { hft } from './hft/index.js';
+import { hft, venues } from './hft/index.js';
 import { logger } from './lib/logger.js';
 import { market } from './market/marketData.js';
 import { redis } from './redis/client.js';
@@ -13,6 +13,8 @@ import { Gateway } from './ws/gateway.js';
 async function main(): Promise<void> {
   await waitForDatabase();
   await market.start();
+  // Competitions whose fills HFT decides are matched in venues of their own, started when first needed.
+  engine.useVenues(venues);
   await engine.start();
   // HFT is given a copy of everything from here on. It cannot hold start-up up or stop it: if the
   // program is missing or will not run, the exchange starts without it and says so in its status.
@@ -50,8 +52,8 @@ async function main(): Promise<void> {
     server.closeIdleConnections();
     setTimeout(() => server.closeAllConnections(), 2_000).unref();
     await closed;
-    // HFT finishes its recording and writes its last statistics.
-    await hft.stop();
+    // HFT finishes its recording and writes its last statistics; so do the realistic sandboxes' venues.
+    await Promise.all([hft.stop(), venues.stop()]);
     // Everything the engine has decided reaches the database before the pool is closed.
     await engine.stop();
     await market.stop();

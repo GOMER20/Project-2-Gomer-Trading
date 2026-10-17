@@ -13,6 +13,10 @@ export interface AccountRules {
   commissionPerShare: Decimal;
   /** Equity below this share of gross exposure means a margin call. Zero switches them off. */
   maintenanceMargin: Decimal;
+  /** standard: this server's engine fills orders against the modelled book. hft: HFT decides the fills (the realistic sandbox; hft/hftVenue.ts). */
+  fillModel: 'standard' | 'hft';
+  /** With fill model hft: how long an order or cancel takes to reach the book, in milliseconds (a little more at random). */
+  orderDelayMs: number;
 }
 
 /**

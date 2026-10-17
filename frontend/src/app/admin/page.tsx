@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from 'react';
 import { AuthGate } from '@/components/AuthGate';
 import { HftPanel } from '@/components/admin/HftPanel';
+import { HftStrategyPanel } from '@/components/admin/HftStrategyPanel';
 import { Panel } from '@/components/ui/Panel';
 import { MoneyPresets, StartingMoney } from '@/components/ui/StartingMoney';
 import { api, API_URL, errorMessage } from '@/lib/api';
@@ -216,6 +217,8 @@ function CreateCompetition({ users, hours, onCreated }: { users: AdminUser[]; ho
   const [openToInvites, setOpenToInvites] = useState(true);
   const [commission, setCommission] = useState('0');
   const [marginCall, setMarginCall] = useState('25');
+  const [realistic, setRealistic] = useState(false);
+  const [orderDelay, setOrderDelay] = useState('2');
   // A fully invested account sits at 100 / leverage percent, so the call level has to be under that.
   const marginCeiling = 100 / (Number(leverage) || 1);
   const marginTooHigh = Number(marginCall) >= marginCeiling;
@@ -245,6 +248,8 @@ function CreateCompetition({ users, hours, onCreated }: { users: AdminUser[]; ho
           leverage: Number(leverage),
           commissionPerShare: Number(commission) || 0,
           maintenanceMargin: (Number(marginCall) || 0) / 100,
+          fillModel: realistic ? 'hft' : 'standard',
+          orderDelayMs: realistic ? Math.round(Number(orderDelay) || 0) : 0,
           allowShorting,
           openToInvites,
           traderIds: [...selected],
@@ -293,7 +298,7 @@ function CreateCompetition({ users, hours, onCreated }: { users: AdminUser[]; ho
           <input id="competition-end" type="datetime-local" value={end} onChange={(e) => setEnd(e.target.value)} required className={`${input} num`} />
         </Field>
         <Field id="competition-balance" title="Starting money ($), any amount">
-          <input id="competition-balance" type="number" min={100} max={1_000_000_000} step={1000} value={balance} onChange={(e) => setBalance(e.target.value)} required className={`${input} num`} />
+          <input id="competition-balance" type="number" min={100} max={1_000_000_000} step="any" value={balance} onChange={(e) => setBalance(e.target.value)} required className={`${input} num`} />
           <div className="mt-1">
             <MoneyPresets value={Number(balance)} onPick={(amount) => setBalance(String(amount))} />
           </div>
@@ -326,6 +331,21 @@ function CreateCompetition({ users, hours, onCreated }: { users: AdminUser[]; ho
         <input type="checkbox" checked={allowShorting} onChange={(e) => setAllowShorting(e.target.checked)} className="accent-(--color-accent)" />
         Allow short selling
       </label>
+      <label className="flex items-center gap-2 text-xs text-dim">
+        <input type="checkbox" checked={realistic} onChange={(e) => setRealistic(e.target.checked)} className="accent-(--color-accent)" />
+        Realistic fills: HFT decides them (a sandbox for trading programs)
+      </label>
+      {realistic ? (
+        <div className="grid grid-cols-[1fr_2fr] items-end gap-3">
+          <Field id="competition-delay" title="Order delay (ms)">
+            <input id="competition-delay" type="number" min={0} max={10_000} step={1} value={orderDelay} onChange={(e) => setOrderDelay(e.target.value)} className={`${input} num`} />
+          </Field>
+          <p className="pb-1 text-[11px] leading-relaxed text-faint">
+            Orders wait in line behind the market&apos;s own at each price, the market&apos;s trades really trade with the queue, and every order and cancel takes this long (and up to half as long again) to reach
+            the book. Other competitions are not affected.
+          </p>
+        </div>
+      ) : null}
       <label className="flex items-center gap-2 text-xs text-dim">
         <input type="checkbox" checked={openToInvites} onChange={(e) => setOpenToInvites(e.target.checked)} className="accent-(--color-accent)" />
         Let people sign themselves up with an invite code
@@ -456,6 +476,63 @@ function Invite({ competition, reach, onChanged }: { competition: Competition; r
   );
 }
 
+interface Participant {
+  portfolioId: string;
+  traderId: string;
+  displayName: string;
+  isBot: boolean;
+  startingBalance: number;
+  totalEquity: number;
+}
+
+/** Every account in a competition, each with its own starting money and the switch to change that one alone. */
+function AccountsMoney({ competition }: { competition: Competition }) {
+  const [open, setOpen] = useState(false);
+  const [accounts, setAccounts] = useState<Participant[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const load = useCallback(async () => {
+    try {
+      setAccounts((await api<{ participants: Participant[] }>(`/api/competitions/${competition.id}/participants`)).participants);
+      setError(null);
+    } catch (err) {
+      setError(errorMessage(err));
+    }
+  }, [competition.id]);
+  useEffect(() => {
+    if (open) void load();
+  }, [open, load]);
+
+  return (
+    <div className="mt-2">
+      <button type="button" onClick={() => setOpen(!open)} aria-expanded={open} className="text-[11px] text-dim hover:text-ink">
+        {open ? '▾' : '▸'} Money for one account ({competition.participants})
+      </button>
+      {open ? (
+        <ul className="mt-1 rounded-sm border border-line/60">
+          {error ? <li className="px-2 py-1.5 text-[11px] text-down">{error}</li> : null}
+          {!accounts && !error ? <li className="px-2 py-1.5 text-[11px] text-faint">Loading…</li> : null}
+          {accounts?.map((a) => (
+            <li key={a.portfolioId} className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-line/40 px-2 py-1.5 last:border-b-0">
+              <span className="min-w-40 text-[11px]">
+                <span className="num font-semibold text-ink">{a.traderId}</span> <span className="text-dim">{a.displayName}</span>
+                {a.isBot ? <span className="ml-1.5 rounded-xs border border-line px-1 text-[9px] uppercase text-faint">program</span> : null}
+              </span>
+              <StartingMoney
+                label="Starts with"
+                competitionId={competition.id}
+                competitionName={competition.name}
+                current={a.startingBalance}
+                account={{ portfolioId: a.portfolioId, name: a.traderId }}
+                onChanged={() => void load()}
+              />
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </div>
+  );
+}
+
 function CompetitionRow({ competition, reach, onChanged }: { competition: Competition; reach: Reach; onChanged: () => void }) {
   const [ids, setIds] = useState('');
   const [notice, setNotice] = useState<Notice | null>(null);
@@ -488,12 +565,15 @@ function CompetitionRow({ competition, reach, onChanged }: { competition: Compet
       <p className="num mt-1 text-[11px] text-faint">
         {usd(competition.startingBalance)} start · {competition.leverage}× leverage · shorting {competition.allowShorting ? 'on' : 'off'} ·{' '}
         {competition.commissionPerShare > 0 ? `$${competition.commissionPerShare} a share commission` : 'no commission'} ·{' '}
-        {competition.maintenanceMargin > 0 ? `margin call below ${(competition.maintenanceMargin * 100).toFixed(0)}%` : 'no margin calls'} · {competition.participants} trader
+        {competition.maintenanceMargin > 0 ? `margin call below ${(competition.maintenanceMargin * 100).toFixed(0)}%` : 'no margin calls'} ·{' '}
+        {competition.fillModel === 'hft' ? `realistic fills (HFT, ${competition.orderDelayMs} ms order delay) · ` : ''}
+        {competition.participants} trader
         {competition.participants === 1 ? '' : 's'}
       </p>
       {competition.status !== 'ENDED' ? (
         <div className="mt-2">
           <StartingMoney competitionId={competition.id} competitionName={competition.name} current={competition.startingBalance} onChanged={onChanged} />
+          {competition.participants > 0 ? <AccountsMoney competition={competition} /> : null}
         </div>
       ) : null}
       {competition.status !== 'ENDED' ? <Invite competition={competition} reach={reach} onChanged={onChanged} /> : null}
@@ -808,6 +888,10 @@ function AdminConsole() {
 
         <Panel title="Trading programs (bots)" className="col-span-full">
           <Bots competitions={competitions} reach={reach} />
+        </Panel>
+
+        <Panel title="HFT Strategy · market maker" className="col-span-full">
+          <HftStrategyPanel />
         </Panel>
 
         <Panel title="HFT · order book engine" className="col-span-full">

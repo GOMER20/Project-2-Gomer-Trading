@@ -7,6 +7,8 @@ export interface LeaderboardEntry {
   traderId: string;
   displayName: string;
   equity: number;
+  /** What this trader started with. The same for everyone unless an account was funded on its own. */
+  startingBalance: number;
   pnl: number;
   returnPct: number;
 }
@@ -23,17 +25,45 @@ export interface Standing {
   traderId: string;
   displayName: string;
   equity: number;
+  startingBalance: number;
 }
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
-const toEntry = (rank: number, traderId: string, displayName: string, equity: number, startingBalance: number): LeaderboardEntry => ({
+/**
+ * What the board ranks by: the return on the money each trader started with.
+ * When everyone starts with the same amount this orders them exactly as their
+ * equity does; when one account was given more, it gets no head start.
+ */
+export const scoreOf = (equity: number, startingBalance: number) => (startingBalance > 0 ? (equity - startingBalance) / startingBalance : 0);
+
+/** Kept beside each score: name, equity and starting money. */
+interface Detail {
+  n: string;
+  e: number;
+  s: number;
+}
+export const encodeDetail = (displayName: string, equity: number, startingBalance: number) => JSON.stringify({ n: displayName, e: round2(equity), s: startingBalance } satisfies Detail);
+/** Boards written by older versions kept the bare name there and scored by equity. */
+function decodeDetail(raw: string | null | undefined, traderId: string, score: number, competitionStart: number): Detail {
+  if (raw?.startsWith('{')) {
+    try {
+      return JSON.parse(raw) as Detail;
+    } catch {
+      // fall through
+    }
+  }
+  return { n: raw ?? traderId, e: score, s: competitionStart };
+}
+
+const toEntry = (rank: number, traderId: string, detail: Detail): LeaderboardEntry => ({
   rank,
   traderId,
-  displayName,
-  equity: round2(equity),
-  pnl: round2(equity - startingBalance),
-  returnPct: startingBalance > 0 ? round2(((equity - startingBalance) / startingBalance) * 100) : 0,
+  displayName: detail.n,
+  equity: round2(detail.e),
+  startingBalance: detail.s,
+  pnl: round2(detail.e - detail.s),
+  returnPct: detail.s > 0 ? round2(((detail.e - detail.s) / detail.s) * 100) : 0,
 });
 
 /**
@@ -48,10 +78,10 @@ export async function writeLeaderboard(competitionId: string, startingBalance: n
 
   if (standings.length > 0) {
     const staging = `${key}:staging:${randomUUID()}`;
-    multi.zadd(staging, ...standings.flatMap((s) => [s.equity, s.traderId]));
+    multi.zadd(staging, ...standings.flatMap((s) => [scoreOf(s.equity, s.startingBalance), s.traderId]));
     multi.rename(staging, key);
     multi.del(namesKey);
-    multi.hset(namesKey, Object.fromEntries(standings.map((s) => [s.traderId, s.displayName])));
+    multi.hset(namesKey, Object.fromEntries(standings.map((s) => [s.traderId, encodeDetail(s.displayName, s.equity, s.startingBalance)])));
   } else {
     multi.del(key, namesKey);
   }
@@ -72,7 +102,7 @@ export async function readLeaderboard(competitionId: string, limit: number): Pro
   if (!meta.updatedAt) return null;
 
   const traderIds = flat.filter((_, i) => i % 2 === 0);
-  const names = traderIds.length ? await redis.hmget(keys.leaderboardNames(competitionId), ...traderIds) : [];
+  const details = traderIds.length ? await redis.hmget(keys.leaderboardNames(competitionId), ...traderIds) : [];
   const startingBalance = Number(meta.startingBalance);
 
   return {
@@ -80,7 +110,7 @@ export async function readLeaderboard(competitionId: string, limit: number): Pro
     startingBalance,
     participants: Number(meta.participants),
     updatedAt: meta.updatedAt,
-    entries: traderIds.map((traderId, i) => toEntry(i + 1, traderId, names[i] ?? traderId, Number(flat[i * 2 + 1]), startingBalance)),
+    entries: traderIds.map((traderId, i) => toEntry(i + 1, traderId, decodeDetail(details[i], traderId, Number(flat[i * 2 + 1]), startingBalance))),
   };
 }
 
@@ -90,17 +120,18 @@ async function rebuildFromDatabase(competitionId: string): Promise<boolean> {
     competitionId,
   ]);
   if (!competition.rows[0]) return false;
-  const { rows } = await pool.query<{ trader_id: string; display_name: string; total_equity: string }>(
-    `SELECT u.trader_id, u.display_name, p.total_equity
+  const { rows } = await pool.query<{ trader_id: string; display_name: string; total_equity: string; funding: string }>(
+    `SELECT u.trader_id, u.display_name, p.total_equity, p.funding
        FROM portfolios p
        JOIN users u ON u.id = p.user_id
       WHERE p.competition_id = $1`,
     [competitionId],
   );
+  const start = Number(competition.rows[0].starting_balance);
   await writeLeaderboard(
     competitionId,
-    Number(competition.rows[0].starting_balance),
-    rows.map((r) => ({ traderId: r.trader_id, displayName: r.display_name, equity: Number(r.total_equity) })),
+    start,
+    rows.map((r) => ({ traderId: r.trader_id, displayName: r.display_name, equity: Number(r.total_equity), startingBalance: start + Number(r.funding) })),
   );
   return true;
 }
@@ -125,11 +156,11 @@ export async function getLeaderboard(
   if (inTop) return { ...board, me: inTop };
 
   const key = keys.leaderboard(competitionId);
-  const [rank, score, name] = await Promise.all([
+  const [rank, score, detail] = await Promise.all([
     redis.zrevrank(key, traderId),
     redis.zscore(key, traderId),
     redis.hget(keys.leaderboardNames(competitionId), traderId),
   ]);
-  const me = rank === null || score === null ? null : toEntry(rank + 1, traderId, name ?? traderId, Number(score), board.startingBalance);
+  const me = rank === null || score === null ? null : toEntry(rank + 1, traderId, decodeDetail(detail, traderId, Number(score), board.startingBalance));
   return { ...board, me };
 }
