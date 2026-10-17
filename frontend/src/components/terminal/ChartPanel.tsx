@@ -290,13 +290,14 @@ export function ChartPanel() {
               title={indicator.title}
               onClick={() => toggleIndicator(indicator.id)}
               aria-pressed={indicators[indicator.id]}
-              className={`${toggle} hidden items-center gap-1 md:flex ${indicators[indicator.id] ? 'text-ink' : 'text-faint hover:text-dim'}`}
+              // On the narrowest layout the price and its change need the room; the indicators come back from 1280px.
+              className={`${toggle} hidden items-center gap-1 xl:flex ${indicators[indicator.id] ? 'text-ink' : 'text-faint hover:text-dim'}`}
             >
               <span className="h-0.5 w-2.5 rounded-full" style={{ background: indicators[indicator.id] ? indicator.color : 'currentColor' }} />
               {indicator.label}
             </button>
           ))}
-          <span className="mx-1 hidden h-3.5 w-px bg-line md:block" />
+          <span className="mx-1 hidden h-3.5 w-px bg-line xl:block" />
           {TIMEFRAMES.map((t) => (
             <button
               key={t.id}

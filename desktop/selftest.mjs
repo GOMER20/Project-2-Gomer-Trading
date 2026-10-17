@@ -47,7 +47,17 @@ export async function run({ directory, origin, mainWindow, settingsWindow, labWi
     throw new Error(`timed out waiting for: ${description}`);
   };
   const waitFor = (description, code, timeoutMs) => waitIn(() => mainWindow.webContents, description, code, timeoutMs);
-  const capture = async (name, window = mainWindow) => fs.writeFileSync(path.join(directory, name), (await window.webContents.capturePage()).toPNG());
+  /** A screenshot for the record. The compositor occasionally refuses one (UnknownVizError); that is retried, and never fails the run. */
+  const capture = async (name, window = mainWindow) => {
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      try {
+        return fs.writeFileSync(path.join(directory, name), (await window.webContents.capturePage()).toPNG());
+      } catch (err) {
+        if (attempt === 4) (result.captureErrors ??= []).push(`${name}: ${err?.message ?? err}`);
+        else await sleep(500 * attempt);
+      }
+    }
+  };
 
   /** Gets to the terminal as TRADER01, whether or not a session was saved. */
   async function reachTerminal() {

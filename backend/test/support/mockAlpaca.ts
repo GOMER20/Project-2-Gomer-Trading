@@ -100,6 +100,8 @@ export async function startMockAlpaca(port = 0): Promise<MockAlpaca> {
       }
     },
     dropConnections() {
+      // Like the real feed, a dropped connection takes its subscriptions with it; the client must resubscribe.
+      mock.subscribed = new Set();
       for (const socket of clients) socket.terminate();
     },
     close: () =>

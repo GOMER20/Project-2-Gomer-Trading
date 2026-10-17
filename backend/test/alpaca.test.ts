@@ -122,11 +122,12 @@ describe('AlpacaProvider', () => {
     await until(() => mock.subscribed.size === 2, 'the first subscription');
 
     mock.dropConnections();
-    await until(() => mock.connections === 2 && mock.subscribed.size === 2, 'the reconnect and resubscribe');
+    // The provider waits 1s, then 2s, between attempts, so a busy machine can need a second try.
+    await until(() => mock.connections >= 2 && mock.subscribed.size === 2, 'the reconnect and resubscribe', 10_000);
 
     mock.tick('MSFT', { last: 433.5 });
     await until(() => updates.some((u) => u.symbol === 'MSFT' && u.last === 433.5), 'a tick on the new connection');
-  });
+  }, 20_000);
 
   it('explains the one-connection limit and recovers when the other session ends', async () => {
     mock = await startMockAlpaca();

@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { useState } from 'react';
+import { useLayoutEffect, useRef, useState } from 'react';
 import { duration, localMoment, markOf, newYorkMoment, pnlColor, signedPct, signedUsd, timeRemaining, usd } from '@/lib/format';
 import { desktopBridge } from '@/lib/desktop';
 import { useHydrated, useNow } from '@/lib/hooks';
@@ -39,8 +39,9 @@ function liveMarginPct(portfolio: Portfolio | null, quotes: Record<string, Quote
 function Stat({ label, value, tone = 'text-ink', sub }: { label: string; value: string; tone?: string; sub?: string }) {
   return (
     <div className="flex shrink-0 flex-col justify-center px-3">
-      <span className="text-[10px] font-medium uppercase tracking-wider text-faint">{label}</span>
-      <span className={`num whitespace-nowrap text-[13px] font-semibold leading-tight ${tone}`}>
+      {/* self-start: each line is as wide as its text, which is what the top bar measures. */}
+      <span className="self-start whitespace-nowrap text-[10px] font-medium uppercase tracking-wider text-faint">{label}</span>
+      <span className={`num self-start whitespace-nowrap text-[13px] font-semibold leading-tight ${tone}`}>
         {value}
         {sub ? <span className="ml-1.5 text-[11px] font-normal">{sub}</span> : null}
       </span>
@@ -160,7 +161,7 @@ function MarketClock() {
   ].join(' ');
 
   return (
-    <span title={title} className="hidden items-center gap-1.5 whitespace-nowrap text-[11px] text-dim lg:flex">
+    <span title={title} className="hidden items-center gap-1.5 whitespace-nowrap text-[11px] text-dim xl:flex">
       <span className={`size-1.5 rounded-full ${open ? 'bg-up' : 'bg-faint'}`} />
       US market {open ? 'open, closes' : 'opens'} <span className="num text-ink">{localMoment(moment, now)}</span>
     </span>
@@ -177,6 +178,33 @@ export function TopBar({ competition }: { competition: Competition | undefined }
   const user = useAuthStore((s) => s.user);
   const logout = useAuthStore((s) => s.logout);
   const [changingPassword, setChangingPassword] = useState(false);
+
+  // The account figures share the top line when everything fits, and otherwise take a full-width
+  // line of their own, spaced evenly, so no figure is ever hidden or has to be scrolled to.
+  const header = useRef<HTMLElement>(null);
+  const figures = useRef<HTMLDivElement>(null);
+  const [stacked, setStacked] = useState(false);
+  const measure = useRef(() => {});
+  measure.current = () => {
+    const bar = header.current;
+    const strip = figures.current;
+    if (!bar || !strip) return;
+    // Each figure's own width: its longer line plus 12px padding each side and the divider.
+    const natural = [...strip.querySelectorAll(':scope > div, :scope > span > div')].reduce(
+      (sum, stat) => sum + Math.max(...[...stat.children].map((line) => line.getBoundingClientRect().width)) + 25,
+      0,
+    );
+    const others = [...bar.children].filter((child) => child !== strip && !(child as HTMLElement).dataset.fullRow).reduce((sum, child) => sum + (child as HTMLElement).scrollWidth + 1, 0);
+    setStacked(others + natural + 16 > bar.clientWidth);
+  };
+  // After every render (the figures may have grown) and whenever the window changes size.
+  useLayoutEffect(() => measure.current());
+  useLayoutEffect(() => {
+    if (!header.current) return;
+    const observer = new ResizeObserver(() => measure.current());
+    observer.observe(header.current);
+    return () => observer.disconnect();
+  }, []);
   const competitions = useTradingStore((s) => s.competitions);
   const portfolio = useTradingStore((s) => s.portfolio);
   const setCompetition = useUiStore((s) => s.setCompetition);
@@ -194,7 +222,7 @@ export function TopBar({ competition }: { competition: Competition | undefined }
   const unrealized = equity !== null && portfolio ? equity - portfolio.cash - portfolio.positions.reduce((sum, p) => sum + p.averagePrice * p.quantity, 0) : null;
 
   return (
-    <header className="flex shrink-0 flex-wrap items-stretch border-b border-line bg-panel">
+    <header ref={header} className="flex shrink-0 flex-wrap items-stretch border-b border-line bg-panel">
       <div className="flex h-12 items-center gap-2.5 border-r border-line px-3">
         <span className="flex size-7 items-center justify-center rounded-sm bg-accent text-[11px] font-black tracking-tighter text-surface">GT</span>
         {/* Stacked so the name costs no more width than one word. */}
@@ -225,8 +253,15 @@ export function TopBar({ competition }: { competition: Competition | undefined }
         {competition ? <Countdown competition={competition} /> : null}
       </div>
 
-      {/* Own row below xl so the figures never get squeezed; scrolls sideways on phones. */}
-      <div className="order-last flex h-12 basis-full items-stretch divide-x divide-line overflow-x-auto border-t border-line xl:order-none xl:flex-1 xl:basis-0 xl:border-t-0">
+      <div
+        ref={figures}
+        className={`flex h-12 items-stretch divide-x divide-line ${
+          stacked
+            ? // Equal columns across the whole width; a phone too narrow even for that scrolls sideways.
+              'order-last grid basis-full auto-cols-[minmax(max-content,1fr)] grid-flow-col overflow-x-auto border-t border-line'
+            : 'min-w-0 flex-1'
+        }`}
+      >
         <Stat label="Total equity" value={equity === null ? '—' : usd(equity)} />
         <Stat
           label="Total P&L"
@@ -250,12 +285,13 @@ export function TopBar({ competition }: { competition: Competition | undefined }
         ) : null}
       </div>
       {showMargin && marginPct < callAt * 1.15 ? (
-        <div role="alert" className="order-last w-full border-t border-down/40 bg-down/10 px-3 py-1 text-xs text-down">
+        <div role="alert" data-full-row="true" className="order-last w-full border-t border-down/40 bg-down/10 px-3 py-1 text-xs text-down">
           Margin warning: your equity is {marginPct.toFixed(1)}% of your positions. Below {callAt.toFixed(0)}% everything is closed at the market. Reduce a position to move away from it.
         </div>
       ) : null}
 
-      <div className="ml-auto flex h-12 items-center gap-3 border-l border-line px-3">
+      {/* Wraps onto a second line on a phone rather than running off the screen. */}
+      <div className="ml-auto flex min-h-12 flex-wrap items-center justify-end gap-x-3 gap-y-1 border-l border-line px-3 py-1.5">
         <MarketClock />
         <FeedBadge />
         <span className="num text-xs font-semibold text-ink" title={user?.displayName}>
@@ -264,10 +300,10 @@ export function TopBar({ competition }: { competition: Competition | undefined }
         {user?.owner ? (
           // The AT and HFT windows, also in the opening screen's Test Lab and the app's Trading menu.
           <span className="flex items-center gap-2">
-            <button type="button" onClick={() => openLabWindow('at')} title="Open the algorithmic trading (AT) window" className="text-xs text-accent hover:underline">
+            <button type="button" onClick={() => openLabWindow('at')} title="Open the algorithmic trading (AT) window" className="whitespace-nowrap text-xs text-accent hover:underline">
               AT ↗
             </button>
-            <button type="button" onClick={() => openLabWindow('hft')} title="Open the high-frequency trading (HFT) window" className="text-xs text-accent hover:underline">
+            <button type="button" onClick={() => openLabWindow('hft')} title="Open the high-frequency trading (HFT) window" className="whitespace-nowrap text-xs text-accent hover:underline">
               HFT ↗
             </button>
           </span>

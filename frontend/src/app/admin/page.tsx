@@ -134,7 +134,7 @@ function Accounts({ users, me, onChanged }: { users: AdminUser[]; me: string | u
       ) : null}
       <ul className="max-h-72 overflow-y-auto">
         {users.map((user) => (
-          <li key={user.id} className={`flex items-center justify-between gap-2 border-b border-line/60 px-3 py-1.5 text-xs last:border-b-0 ${user.isActive ? '' : 'opacity-60'}`}>
+          <li key={user.id} className={`flex flex-wrap items-center justify-between gap-x-2 gap-y-1 border-b border-line/60 px-3 py-1.5 text-xs last:border-b-0 ${user.isActive ? '' : 'opacity-60'}`}>
             <span className="min-w-0 truncate">
               <span className={`mr-2 inline-block size-1.5 rounded-full align-middle ${user.online ? 'bg-up' : 'bg-line'}`} title={user.online ? 'Online now' : 'Not connected'} />
               <span className="num font-semibold text-ink">{user.traderId}</span>
@@ -786,7 +786,7 @@ function AdminConsole() {
         </Link>
       </header>
 
-      <main className="mx-auto grid max-w-6xl gap-3 p-3 lg:grid-cols-2">
+      <main className="mx-auto grid max-w-6xl grid-cols-1 gap-3 p-3 lg:grid-cols-2">
         {error ? (
           <p role="alert" className="col-span-full rounded-sm border border-down/40 bg-down/10 px-3 py-2 text-xs text-down">
             {error}

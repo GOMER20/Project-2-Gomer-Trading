@@ -53,7 +53,8 @@ const summarise = (times: number[]): Summary => {
   };
 };
 
-// Signing in is timed separately: it queues by design, and would otherwise hide how trading is doing.
+// Anything that hashes a password (signing in, joining, creating an account or setting a password)
+// is timed separately: it is slow and queues by design, and would otherwise hide how trading is doing.
 let current = { trading: [] as number[], signIn: [] as number[] };
 let lastWindow = { trading: summarise([]), signIn: summarise([]) };
 setInterval(() => {
@@ -66,7 +67,8 @@ export const responseTimes = () => lastWindow;
 
 export const timeRequests: RequestHandler = (req, res, next) => {
   const started = performance.now();
-  const bucket = req.path.startsWith('/auth/') ? current.signIn : current.trading;
+  const hashesPassword = req.path.startsWith('/auth/') || req.path.startsWith('/users') || /^\/invites\/[^/]+\/join/.test(req.path);
+  const bucket = hashesPassword ? current.signIn : current.trading;
   res.once('finish', () => {
     if (bucket.length < 50_000) bucket.push(performance.now() - started);
   });

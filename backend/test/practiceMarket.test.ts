@@ -1,6 +1,7 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FeedStatus, QuoteUpdate } from '../src/market/provider.js';
 import type { PracticeMarketOptions, SimulatedProvider as SimulatedProviderClass } from '../src/market/simulatedProvider.js';
+import { LISTINGS } from '../src/market/universe.js';
 import { sessionOn } from '../src/market/usMarketHours.js';
 
 // The market keeps its memory in Postgres on a best-effort basis; here it has none.
@@ -44,6 +45,15 @@ describe('the practice market keeping exchange hours', () => {
     provider.subscribe(['AAPL', 'GME', 'SPY']);
   }
   const state = () => statuses[statuses.length - 1]?.state;
+  /** The midpoint of every listed stock right now. */
+  const snapshotAll = async () => {
+    const prices: Record<string, number> = {};
+    for (const { symbol } of LISTINGS) {
+      const quote = (await provider.fetchSnapshot(symbol))!;
+      prices[symbol] = (quote.bid + quote.ask) / 2;
+    }
+    return prices;
+  };
   const latest = (symbol: string) => updates.filter((u) => u.symbol === symbol).at(-1)!;
 
   beforeEach(() => vi.useFakeTimers());
@@ -77,6 +87,7 @@ describe('the practice market keeping exchange hours', () => {
     await vi.advanceTimersByTimeAsync(2 * MINUTE);
     expect(state()).toBe('closed');
     const friday = Object.fromEntries(['AAPL', 'GME', 'SPY'].map((s) => [s, latest(s)]));
+    const closes = await snapshotAll();
     updates.length = 0;
 
     // The weekend passes with the Mac asleep, then it wakes just before the open.
@@ -88,16 +99,17 @@ describe('the practice market keeping exchange hours', () => {
     await vi.advanceTimersByTimeAsync(40 * SECOND);
     expect(state()).toBe('streaming');
     expect(Math.min(...updates.map((u) => u.ts))).toBeGreaterThanOrEqual(at('2026-10-12T13:30:00Z'));
-    let moved = 0;
     for (const symbol of ['AAPL', 'GME', 'SPY']) {
       const first = updates.find((u) => u.symbol === symbol)!;
       // The reference for "today's change" is the last trade of the previous session.
       expect(first.prevClose).toBe(friday[symbol]!.last);
-      const gap = Math.abs(Math.log(first.last! / friday[symbol]!.last!));
-      expect(gap).toBeLessThan(0.25);
-      if (gap > 0.0005) moved++;
     }
-    expect(moved).toBeGreaterThanOrEqual(2);
+    // Every stock opens somewhere new, none absurdly far. Any one of them can open almost flat by
+    // chance, so this looks at all of them: most must have moved.
+    const opens = await snapshotAll();
+    const gaps = Object.keys(closes).map((symbol) => Math.abs(Math.log(opens[symbol]! / closes[symbol]!)));
+    expect(Math.max(...gaps)).toBeLessThan(0.25);
+    expect(gaps.filter((gap) => gap > 0.0005).length).toBeGreaterThan(gaps.length / 2);
   });
 
   it('gaps once per session: a restart in the middle of the day carries on from where it was', async () => {

@@ -15,9 +15,14 @@ function Row({ entry, mine }: { entry: LeaderboardEntry; mine: boolean }) {
       <td className={`num border-l-2 py-1.5 pl-2 pr-1 text-xs font-bold ${mine ? 'border-accent' : 'border-transparent'} ${RANK_COLOR[entry.rank - 1] ?? 'text-faint'}`}>
         {entry.rank}
       </td>
-      <td className="max-w-0 truncate py-1.5 pr-2 text-xs">
-        <span className={mine ? 'font-semibold text-ink' : 'text-ink/90'}>{entry.displayName}</span>
-        {mine ? <span className="ml-1.5 text-[10px] font-semibold uppercase text-accent">you</span> : null}
+      <td className="max-w-0 py-1.5 pr-2 text-xs">
+        {/* A long name is shortened; the "you" tag always stays in view. */}
+        <span className="flex min-w-0 items-center gap-1.5">
+          <span className={`truncate ${mine ? 'font-semibold text-ink' : 'text-ink/90'}`} title={entry.displayName}>
+            {entry.displayName}
+          </span>
+          {mine ? <span className="shrink-0 text-[10px] font-semibold uppercase text-accent">you</span> : null}
+        </span>
       </td>
       <td className="num py-1.5 pr-2 text-right text-xs text-ink">{usd(entry.equity)}</td>
       <td className={`num py-1.5 pr-2 text-right text-xs ${pnlColor(entry.pnl)}`}>{signedPct(entry.returnPct)}</td>
