@@ -1,0 +1,887 @@
+#pragma once
+
+#include <algorithm>
+#include <atomic>
+#include <cassert>
+#include <concepts>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include "lob/compiler.hpp"
+#include "lob/messages.hpp"
+#include "lob/order_book.hpp"
+#include "lob/recording.hpp"
+#include "lob/spsc_ring.hpp"
+#include "lob/thread_affinity.hpp"
+
+namespace lob {
+
+inline constexpr int kNoPinning = -1;
+
+enum class IdleStrategy : std::uint8_t {
+  Spin,   // busy-wait for the next command: lowest latency, occupies a whole core
+  Yield,  // give up the time slice when there is nothing to do
+};
+
+struct EngineConfig {
+  std::vector<BookConfig> books;           // one per symbol; a symbol's ID is its position here
+  std::size_t command_capacity = 1 << 16;  // inbound ring; rounded up to a power of two
+  std::size_t event_capacity = 1 << 16;    // outbound ring; rounded up to a power of two
+  IdleStrategy idle = IdleStrategy::Spin;
+  int pin_to_cpu = kNoPinning;             // CPU to bind the engine thread to (Linux only)
+
+  // Time one command in this many, on average, to estimate how long each
+  // symbol's commands take; see time_spent(). 0 turns timing off.
+  std::uint32_t time_one_in = 64;
+
+  // Capacity of the market data ring; rounded up to a power of two. 0 turns
+  // the market data feed off, which is the default: it costs something on
+  // every order, and not every use of the engine wants it.
+  std::size_t market_data_capacity = 0;
+
+  // A file to record the session in: every command the engine is sent, in
+  // order, so that the session can be replayed later. See recording.hpp and
+  // replay.hpp. Empty, the default, records nothing.
+  std::string record_to = {};
+
+  // How many commands may be waiting to be written to that file before the
+  // engine starts refusing new ones; rounded up to a power of two.
+  std::size_t recording_capacity = 1 << 16;
+
+  // Stop recording after this many commands; 0, the default, never stops. The
+  // file then holds the start of the session and replays as the session up to
+  // that point. For an engine left running for days, whose recording would
+  // otherwise grow until the disk was full: a command is 32 bytes.
+  std::uint64_t recording_limit = 0;
+};
+
+// Decides how much of one timed command to count, and keeps `typical_x256` up
+// to date: a running average of what a timed command takes, held as 256 times
+// its value so that it stays meaningful on clocks so coarse that most commands
+// measure as zero or one tick.
+//
+// A sample is capped at 64 times that average. Now and then the thread is
+// interrupted in the middle of a timed command, and the stopwatch reads
+// thousands of times too long; uncapped, one such reading would pass for a
+// great deal of work. A symbol whose commands really are that expensive is
+// not held down for long, because each capped sample still pulls the average
+// up, by a factor of nearly five, and within a few samples its commands are
+// counted in full.
+[[nodiscard]] inline std::uint64_t cap_timed_sample(std::uint64_t elapsed,
+                                                    std::uint64_t& typical_x256) noexcept {
+  if (typical_x256 == 0) {
+    typical_x256 = elapsed * 256;  // nothing to compare with yet
+    return elapsed;
+  }
+  const std::uint64_t ceiling = std::max<std::uint64_t>(typical_x256 / 4, 1);  // 64 x typical
+  const std::uint64_t counted = std::min(elapsed, ceiling);
+  // Move the average a sixteenth of the way towards this sample.
+  typical_x256 = typical_x256 - typical_x256 / 16 + counted * 16;
+  return counted;
+}
+
+// The three milestones of moving one symbol from one engine to another. Each
+// holds the number of the latest move to have reached it; the moves of a
+// symbol are numbered 1, 2, 3 and so on.
+struct MigrationGate {
+  std::atomic<std::uint32_t> detached{0};   // the old engine has let go of the book
+  std::atomic<std::uint32_t> delivered{0};  // everything the old engine said has been read
+  std::atomic<std::uint32_t> attached{0};   // the new engine has taken the book up
+};
+
+// What the market data feed remembers about one symbol between messages. It
+// goes wherever the symbol's book goes, so that the numbering carries on
+// across a move from one engine to another.
+struct FeedState {
+  std::uint64_t sequence = 0;  // the last sequence number used for this symbol
+  // The best prices as last published, to tell whether they have changed.
+  Price bid_price = 0;
+  std::uint64_t bid_quantity = 0;
+  Price ask_price = 0;
+  std::uint64_t ask_quantity = 0;
+};
+
+// Shared by a group of engines that can pass symbols between them: every
+// symbol's book, its gate and its feed state. The engines do not own the
+// books.
+struct SymbolDirectory {
+  explicit SymbolDirectory(std::size_t symbols)
+      : books(symbols, nullptr), gates(symbols), feeds(symbols) {}
+
+  std::vector<OrderBook*> books;     // by SymbolId
+  std::vector<MigrationGate> gates;  // by SymbolId
+  std::vector<FeedState> feeds;      // by SymbolId; used only by the engine running the symbol
+};
+
+// One order book per symbol, all running on a single engine thread that is fed
+// and read through two SPSC rings:
+//
+//   gateway thread --Command--> [ engine thread: OrderBooks ] --Event--> publisher thread
+//
+// The books stay single-threaded and lock-free; the rings are the only things
+// shared between threads. Each ring allows exactly one thread on each end, so:
+//
+//   submit(), cancel()   one gateway thread
+//   poll()               one publisher thread
+//   start(), stop()      one controlling thread
+//
+// The gateway and publisher may be the same thread.
+//
+// A symbol is named by its SymbolId: its position in EngineConfig::books. That
+// makes routing a command to its book one array index, with no string
+// comparison or hashing on the hot path. Use symbol_id() to turn a name into
+// an ID once, up front. Books are independent: each has its own price range,
+// capacity and order IDs, so an order is identified by its symbol and its
+// order ID together.
+//
+// Events are never dropped while the engine is running: if the event ring is
+// full, the engine waits for the publisher. The one exception is shutdown, to
+// guarantee stop() returns even if nobody is reading: events that still cannot
+// be delivered once stop() has been called are discarded and counted in
+// events_dropped(). To lose nothing, poll until every command has been
+// answered, then call stop().
+class MatchingEngine {
+ public:
+  static constexpr std::size_t kMaxSymbols = std::numeric_limits<SymbolId>::max();
+
+  // An engine with books of its own. All memory for every book and both rings
+  // is acquired here.
+  explicit MatchingEngine(const EngineConfig& config)
+      : books_(config.books.size(), nullptr),
+        handled_(config.books.size()),
+        timed_(config.books.size()),
+        own_feeds_(config.books.size()),
+        feeds_(own_feeds_.data()),
+        commands_(config.command_capacity),
+        events_(config.event_capacity),
+        market_data_(std::max<std::size_t>(config.market_data_capacity, 1)),
+        idle_(config.idle),
+        pin_to_cpu_(config.pin_to_cpu),
+        time_one_in_(config.time_one_in),
+        feed_on_(config.market_data_capacity != 0),
+        sample_countdown_(config.time_one_in != 0 ? 1 : 0) {
+    assert(!config.books.empty() && config.books.size() <= kMaxSymbols);
+    owned_.reserve(config.books.size());
+    for (std::size_t symbol = 0; symbol < config.books.size(); ++symbol) {
+      owned_.push_back(std::make_unique<OrderBook>(config.books[symbol]));
+      books_[symbol] = owned_.back().get();
+    }
+    if (!config.record_to.empty()) {
+      own_recorder_ = std::make_unique<SessionRecorder>(
+          config.record_to, config.books, config.recording_capacity, config.recording_limit);
+      recorder_ = own_recorder_.get();
+    }
+  }
+
+  // One engine of a group that can pass symbols between its members; this is
+  // how ShardedEngine builds its shards. The books belong to the directory's
+  // owner and must outlive the engine. The engine starts out running the
+  // symbols listed in `running`; config.books and config.record_to are
+  // ignored. If the group is recording its session, `recorder` is where: one
+  // recorder for the whole group, which must outlive the engine too.
+  MatchingEngine(const EngineConfig& config, SymbolDirectory& directory,
+                 std::span<const SymbolId> running, SessionRecorder* recorder = nullptr)
+      : books_(directory.books.size(), nullptr),
+        handled_(directory.books.size()),
+        timed_(directory.books.size()),
+        directory_(&directory),
+        feeds_(directory.feeds.data()),
+        recorder_(recorder),
+        commands_(config.command_capacity),
+        events_(config.event_capacity),
+        market_data_(std::max<std::size_t>(config.market_data_capacity, 1)),
+        idle_(config.idle),
+        pin_to_cpu_(config.pin_to_cpu),
+        time_one_in_(config.time_one_in),
+        feed_on_(config.market_data_capacity != 0),
+        sample_countdown_(config.time_one_in != 0 ? 1 : 0) {
+    for (const SymbolId symbol : running) {
+      books_[symbol] = directory.books[symbol];
+    }
+  }
+
+  ~MatchingEngine() { stop(); }
+
+  MatchingEngine(const MatchingEngine&) = delete;
+  MatchingEngine& operator=(const MatchingEngine&) = delete;
+
+  // --- Controlling thread ----------------------------------------------------
+
+  // Returns once the engine thread is up, so pinned() can be trusted from
+  // then on.
+  void start() {
+    assert(!thread_.joinable());
+    stop_requested_.store(false, std::memory_order_release);
+    started_.store(false, std::memory_order_release);
+    pinned_.store(false, std::memory_order_release);
+    thread_ = std::thread([this] { run(); });
+    while (!started_.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+  }
+
+  // Processes every command that was queued before the call, then joins the
+  // engine thread. If the engine is recording its session, the recording is
+  // complete on return: see flush_recording(). Safe to call when the engine
+  // is not running.
+  void stop() {
+    request_stop();
+    join();
+    if (own_recorder_ != nullptr) {
+      own_recorder_->flush();
+    }
+  }
+
+  // The two halves of stop(), for stopping several engines together: ask them
+  // all to stop first, then wait for each.
+  void request_stop() noexcept {
+    if (thread_.joinable()) {
+      stop_requested_.store(true, std::memory_order_release);
+    }
+  }
+
+  void join() {
+    if (thread_.joinable()) {
+      thread_.join();
+    }
+  }
+
+  [[nodiscard]] bool running() const noexcept { return thread_.joinable(); }
+
+  // Whether the engine thread is bound to the CPU asked for in the config.
+  // False if no CPU was asked for, or if the request could not be honoured;
+  // the engine runs either way, so check this if pinning matters to you.
+  [[nodiscard]] bool pinned() const noexcept { return pinned_.load(std::memory_order_acquire); }
+
+  // --- Symbols: any thread ---------------------------------------------------
+
+  [[nodiscard]] std::size_t symbol_count() const noexcept { return books_.size(); }
+
+  // The ID of the book with this symbol name, among the books this engine was
+  // built with. A linear search over the names: do it once at start-up, not
+  // per order.
+  [[nodiscard]] std::optional<SymbolId> symbol_id(std::string_view name) const noexcept {
+    for (std::size_t index = 0; index < owned_.size(); ++index) {
+      if (owned_[index]->symbol() == name) {
+        return static_cast<SymbolId>(index);
+      }
+    }
+    return std::nullopt;
+  }
+
+  // --- Gateway thread --------------------------------------------------------
+  // All of these return false if the command ring is full; the caller decides
+  // whether to retry. A command for a symbol the engine is not running is
+  // accepted here and answered with Rejected or CancelRejected.
+  //
+  // If the session is being recorded, a command is recorded if and only if it
+  // is queued here, and in the same order. A command also gets false if the
+  // recorder has fallen so far behind that it has no room for it.
+
+  [[nodiscard]] bool submit(std::uint64_t client_tag, SymbolId symbol, Side side, Price price,
+                            Quantity quantity,
+                            OrderType order_type = OrderType::Limit) noexcept {
+    Command command{};
+    command.client_tag = client_tag;
+    command.price = price;
+    command.quantity = quantity;
+    command.symbol = symbol;
+    command.side = side;
+    command.type = CommandType::Submit;
+    command.order_type = order_type;
+    return send(command);
+  }
+
+  [[nodiscard]] bool cancel(std::uint64_t client_tag, SymbolId symbol,
+                            OrderId order_id) noexcept {
+    Command command{};
+    command.client_tag = client_tag;
+    command.order_id = order_id;
+    command.symbol = symbol;
+    command.type = CommandType::Cancel;
+    return send(command);
+  }
+
+  // The two halves of moving a symbol to another engine of the same group.
+  // Only for engines built with a SymbolDirectory; ShardedEngine calls these.
+  // Neither is recorded: ShardedEngine records the move as a whole.
+  //
+  // detach: once everything queued ahead of it has been handled, the engine
+  // stops running the symbol and publishes a Handoff event as its last word
+  // on it.
+  [[nodiscard]] bool detach(SymbolId symbol, std::uint32_t move_number) noexcept {
+    return commands_.try_push(migration_command(CommandType::Detach, symbol, move_number));
+  }
+
+  // attach: the engine takes the symbol up, but not before the old engine's
+  // Handoff has been read from its event ring. Until then this command, and
+  // everything queued behind it, waits.
+  [[nodiscard]] bool attach(SymbolId symbol, std::uint32_t move_number) noexcept {
+    return commands_.try_push(migration_command(CommandType::Attach, symbol, move_number));
+  }
+
+  // Asks for a fresh picture of one symbol on the market data feed: a Clear,
+  // then a Level for every price with resting orders, then the BestPrices.
+  // For a reader that has just started, or has seen a gap in the sequence
+  // numbers. Does nothing if the feed is off.
+  [[nodiscard]] bool request_snapshot(SymbolId symbol) noexcept {
+    return send(migration_command(CommandType::Snapshot, symbol, 0));
+  }
+
+  // Whether the command ring is full right now. Only the gateway thread adds
+  // to the ring, so if it sees room, its next push will succeed.
+  [[nodiscard]] bool command_ring_full() const noexcept {
+    return commands_.size() == commands_.capacity();
+  }
+
+  // How many commands are queued and not yet handled. Once this is zero, the
+  // engine has dealt with everything sent so far, and every event and market
+  // data message that came of it is waiting to be read, or has been.
+  [[nodiscard]] std::size_t commands_pending() const noexcept { return commands_.size(); }
+
+  // --- Recording: any thread -------------------------------------------------
+
+  // Whether the session is being recorded: a file was asked for, it could be
+  // opened, and every write to it so far has worked. The engine runs either
+  // way, so check this if the recording matters to you.
+  [[nodiscard]] bool recording() const noexcept {
+    return recorder_ != nullptr && recorder_->ok();
+  }
+
+  // Returns once every command sent before the call is in the recording's
+  // file, where another program, or this one, can read it. stop() does this
+  // too. It may be called while the gateway thread carries on sending.
+  void flush_recording() noexcept {
+    if (recorder_ != nullptr) {
+      recorder_->flush();
+    }
+  }
+
+  // Commands written to the recording so far. It trails what has been sent
+  // until flush_recording() returns.
+  [[nodiscard]] std::uint64_t commands_recorded() const noexcept {
+    return recorder_ != nullptr ? recorder_->written() : 0;
+  }
+
+  // Whether the recording has reached EngineConfig::recording_limit and
+  // stopped. Up to date once flush_recording() has returned.
+  [[nodiscard]] bool recording_at_limit() const noexcept {
+    return recorder_ != nullptr && recorder_->at_limit();
+  }
+
+  // --- Publisher thread ------------------------------------------------------
+
+  // Passes every event published so far to `visit`, in order. Returns how many.
+  template <std::invocable<const Event&> Visitor>
+  std::size_t poll(Visitor&& visit) noexcept {
+    return events_.drain(std::forward<Visitor>(visit));
+  }
+
+  // --- Market data thread ----------------------------------------------------
+
+  // Passes every market data message published so far to `visit`, in order.
+  // Returns how many. One thread only, which need not be the publisher thread.
+  //
+  // Unlike events, market data is never waited for. If this reader falls
+  // behind and the ring fills, the engine carries on and the messages that do
+  // not fit are dropped; see market_data_dropped(). The reader sees a jump in
+  // a symbol's sequence numbers and can ask for a snapshot.
+  template <std::invocable<const MarketData&> Visitor>
+  std::size_t poll_market_data(Visitor&& visit) noexcept {
+    return market_data_.drain(std::forward<Visitor>(visit));
+  }
+
+  // --- Engine thread ---------------------------------------------------------
+
+  // Handles the commands currently queued and returns how many it got through.
+  // The engine thread calls this in a loop. If the engine has not been
+  // started, the caller may call it instead to run the engine by hand on its
+  // own thread; nothing can drain events while it runs, so events that do not
+  // fit in the event ring are then discarded and counted.
+  //
+  // It stops early at an Attach whose symbol has not been handed over yet,
+  // leaving that command and everything behind it queued for the next call.
+  std::size_t process_pending() noexcept {
+    // Both of these live in locals while the batch runs, not in members: a
+    // member would be written to memory once per command, which measurably
+    // slows the engine thread.
+    std::uint64_t orders = 0;
+    std::uint32_t countdown = sample_countdown_;
+    const std::size_t count = commands_.drain_while([&](const Command& command) {
+      if (command.type == CommandType::Submit || command.type == CommandType::Cancel) [[likely]] {
+        if (--countdown != 0) [[likely]] {
+          handle_order(command);
+        } else {
+          countdown = handle_order_timed(command);
+        }
+        ++orders;
+        return true;
+      }
+      return handle_other(command);
+    });
+    sample_countdown_ = countdown;
+    if (orders != 0) {
+      commands_processed_.store(commands_processed_.load(std::memory_order_relaxed) + orders,
+                                std::memory_order_release);
+    }
+    return count;
+  }
+
+  // --- Any thread ------------------------------------------------------------
+
+  // Submits and cancels handled so far.
+  [[nodiscard]] std::uint64_t commands_processed() const noexcept {
+    return commands_processed_.load(std::memory_order_acquire);
+  }
+
+  [[nodiscard]] std::uint64_t events_dropped() const noexcept {
+    return events_dropped_.load(std::memory_order_acquire);
+  }
+
+  // Market data messages dropped because the ring was full.
+  [[nodiscard]] std::uint64_t market_data_dropped() const noexcept {
+    return market_data_dropped_.load(std::memory_order_acquire);
+  }
+
+  // How many commands the engine has handled for one symbol, whether they
+  // were accepted or refused. A measure of how busy the symbol is.
+  [[nodiscard]] std::uint64_t commands_handled(SymbolId symbol) const noexcept {
+    assert(symbol < handled_.size());
+    return handled_[symbol].load(std::memory_order_relaxed);
+  }
+
+  // An estimate of how long the engine has spent handling one symbol's
+  // commands, in cycle_ticks(). Unlike commands_handled(), it tells an order
+  // that sweeps fifty price levels apart from one that just rests.
+  //
+  // It is an estimate because only one command in EngineConfig::time_one_in is
+  // timed, and the total is scaled up from those. That keeps the cost on the
+  // hot path to a countdown. A timed command that had to wait for the event
+  // ring is left out, and one that took wildly longer than usual is capped;
+  // see cap_timed_sample(). Always 0 if timing is off.
+  [[nodiscard]] std::uint64_t time_spent(SymbolId symbol) const noexcept {
+    assert(symbol < timed_.size());
+    return timed_[symbol].load(std::memory_order_relaxed) * time_one_in_;
+  }
+
+  // Only meaningful while the engine thread is not running, and only for a
+  // symbol this engine is running.
+  [[nodiscard]] const OrderBook& book(SymbolId symbol) const noexcept {
+    assert(symbol < books_.size() && books_[symbol] != nullptr);
+    return *books_[symbol];
+  }
+
+ private:
+  // Queues a command for the engine thread and, if the session is being
+  // recorded, records it.
+  //
+  // The recorder is asked for room first. This thread is the only one that
+  // records, so room seen now is still there after the push; a command can
+  // therefore never be queued without being recorded, or recorded without
+  // being queued.
+  [[nodiscard]] bool send(const Command& command) noexcept {
+    if (recorder_ == nullptr) [[likely]] {
+      return commands_.try_push(command);
+    }
+    if (!recorder_->can_record() || !commands_.try_push(command)) {
+      return false;
+    }
+    recorder_->record(command);
+    return true;
+  }
+
+  static Command migration_command(CommandType type, SymbolId symbol,
+                                   std::uint32_t move_number) noexcept {
+    Command command{};
+    command.quantity = move_number;
+    command.symbol = symbol;
+    command.type = type;
+    return command;
+  }
+
+  void idle() const noexcept {
+    if (idle_ == IdleStrategy::Yield) {
+      std::this_thread::yield();
+    } else {
+      cpu_relax();
+    }
+  }
+
+  void run() noexcept {
+    if (pin_to_cpu_ != kNoPinning) {
+      pinned_.store(pin_current_thread_to_cpu(pin_to_cpu_), std::memory_order_release);
+    }
+    started_.store(true, std::memory_order_release);
+
+    while (!stop_requested_.load(std::memory_order_acquire)) {
+      if (process_pending() == 0) {
+        idle();
+      }
+    }
+
+    // Shutting down: honour everything queued before stop() was called. If
+    // that includes taking up a symbol another engine has not let go of yet,
+    // wait for it: that engine is shutting down too and will get there.
+    draining_ = true;
+    do {
+      process_pending();
+      if (waiting_to_attach_) {
+        idle();
+      }
+    } while (waiting_to_attach_);
+    draining_ = false;
+  }
+
+  // The commands that are not orders. Returns false if the command cannot be
+  // handled yet and must stay queued.
+  bool handle_other(const Command& command) noexcept {
+    switch (command.type) {
+      case CommandType::Detach:
+        handle_detach(command);
+        return true;
+      case CommandType::Attach:
+        return handle_attach(command);
+      case CommandType::Snapshot:
+        if (feed_on_ && command.symbol < books_.size() && books_[command.symbol] != nullptr) {
+          feed_snapshot(command.symbol, *books_[command.symbol]);
+        }
+        return true;
+      case CommandType::Submit:
+      case CommandType::Cancel:
+      case CommandType::Move:  // only ever found in a recording
+        break;
+    }
+    return true;
+  }
+
+  // Handles one command with a stopwatch on it, and returns how many commands
+  // to let pass before the next one is timed.
+  //
+  // The gap is random, between 1 and twice the configured average, rather
+  // than fixed. A fixed gap could fall into step with a pattern in the order
+  // flow and keep timing the same symbol.
+  std::uint32_t handle_order_timed(const Command& command) noexcept {
+    waited_while_timing_ = false;
+    const std::uint64_t before = cycle_ticks();
+    handle_order(command);
+    const std::uint64_t elapsed = cycle_ticks() - before;
+
+    // Time spent waiting for a full event ring says how slow the reader is,
+    // not how much work the symbol is, so such a sample is thrown away.
+    if (!waited_while_timing_ && command.symbol < timed_.size()) {
+      const std::uint64_t counted = cap_timed_sample(elapsed, typical_sample_x256_);
+      std::atomic<std::uint64_t>& timed = timed_[command.symbol];
+      timed.store(timed.load(std::memory_order_relaxed) + counted, std::memory_order_relaxed);
+    }
+
+    sample_random_ = sample_random_ * 6364136223846793005ULL + 1442695040888963407ULL;
+    return 1 + static_cast<std::uint32_t>((sample_random_ >> 33) % (2 * time_one_in_ - 1));
+  }
+
+  void handle_order(const Command& command) noexcept {
+    // Routing is one bounds check and one array index. A symbol this engine
+    // is not running has no book here, and the command is answered as refused.
+    OrderBook* const book = command.symbol < books_.size() ? books_[command.symbol] : nullptr;
+
+    if (book != nullptr) [[likely]] {
+      // Only this thread writes the counter, so a plain add is enough.
+      std::atomic<std::uint64_t>& handled = handled_[command.symbol];
+      handled.store(handled.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    }
+
+    Event event{};
+    event.client_tag = command.client_tag;
+    event.symbol = command.symbol;
+
+    if (command.type == CommandType::Submit) {
+      SubmitResult result{kInvalidOrderId, 0, 0};
+      if (book != nullptr) [[likely]] {
+        result = book->submit(command.side, command.price, command.quantity, command.order_type,
+                              [&](const Trade& trade) {
+                                Event fill{};
+                                fill.client_tag = command.client_tag;
+                                fill.order_id = trade.taker_id;
+                                fill.maker_id = trade.maker_id;
+                                fill.price = trade.price;
+                                fill.quantity = trade.quantity;
+                                fill.symbol = command.symbol;
+                                fill.side = trade.taker_side;
+                                fill.type = EventType::Trade;
+                                publish(fill);
+                                if (feed_on_) {
+                                  feed_trade(command.symbol, *book, trade);
+                                }
+                              });
+        if (feed_on_) {
+          feed_after_submit(command, *book, result);
+        }
+      }
+      event.order_id = result.id;
+      event.price = command.price;
+      event.quantity = result.filled;
+      event.resting = result.resting;
+      event.side = command.side;
+      event.type = result.id != kInvalidOrderId ? EventType::Accepted : EventType::Rejected;
+    } else {
+      // The feed needs to know which price the order was at, and once it has
+      // been cancelled the book no longer says.
+      Side side = Side::Buy;
+      Price price = 0;
+      if (feed_on_ && book != nullptr) {
+        if (const Order* order = book->find(command.order_id)) {
+          side = order->side;
+          price = order->price;
+        }
+      }
+      const bool cancelled = book != nullptr && book->cancel(command.order_id);
+      if (cancelled && feed_on_) {
+        feed_level(command.symbol, *book, side, price);
+        feed_best_prices(command.symbol, *book, /*even_if_unchanged=*/false);
+      }
+      event.order_id = command.order_id;
+      event.type = cancelled ? EventType::Cancelled : EventType::CancelRejected;
+    }
+    publish(event);
+  }
+
+  // --- The market data feed ---------------------------------------------------
+  // All of this runs only when the feed is on.
+
+  // Numbers a message and offers it to the ring. If the ring is full the
+  // message is dropped, but its number is still used up, which is how a reader
+  // can tell.
+  void feed_send(MarketData& message) noexcept {
+    message.sequence = ++feeds_[message.symbol].sequence;
+    if (!market_data_.try_push(message)) {
+      market_data_dropped_.store(market_data_dropped_.load(std::memory_order_relaxed) + 1,
+                                 std::memory_order_release);
+    }
+  }
+
+  // The total now resting at one price.
+  void feed_level(SymbolId symbol, const OrderBook& book, Side side, Price price) noexcept {
+    MarketData message{};
+    message.type = MarketDataType::Level;
+    message.symbol = symbol;
+    message.side = side;
+    message.price = price;
+    message.quantity = book.quantity_at(side, price);
+    feed_send(message);
+  }
+
+  // The best bid and ask, if they differ from what was last published.
+  void feed_best_prices(SymbolId symbol, const OrderBook& book,
+                        bool even_if_unchanged) noexcept {
+    const std::optional<Price> bid = book.best_bid();
+    const std::optional<Price> ask = book.best_ask();
+    const Price bid_price = bid.value_or(0);
+    const Price ask_price = ask.value_or(0);
+    const std::uint64_t bid_quantity = bid ? book.quantity_at(Side::Buy, *bid) : 0;
+    const std::uint64_t ask_quantity = ask ? book.quantity_at(Side::Sell, *ask) : 0;
+
+    FeedState& last = feeds_[symbol];
+    if (!even_if_unchanged && bid_price == last.bid_price && bid_quantity == last.bid_quantity &&
+        ask_price == last.ask_price && ask_quantity == last.ask_quantity) {
+      return;
+    }
+    last.bid_price = bid_price;
+    last.bid_quantity = bid_quantity;
+    last.ask_price = ask_price;
+    last.ask_quantity = ask_quantity;
+
+    MarketData message{};
+    message.type = MarketDataType::BestPrices;
+    message.symbol = symbol;
+    message.bid_price = bid_price;
+    message.bid_quantity = bid_quantity;
+    message.ask_price = ask_price;
+    message.ask_quantity = ask_quantity;
+    feed_send(message);
+  }
+
+  // Called for each fill. An incoming order may take many orders at one price;
+  // the feed reports every trade, but each price's new total only once, when
+  // the order has finished with that price.
+  void feed_trade(SymbolId symbol, const OrderBook& book, const Trade& trade) noexcept {
+    if (traded_price_pending_ && traded_price_ != trade.price) {
+      feed_level(symbol, book, opposite(trade.taker_side), traded_price_);
+    }
+    traded_price_pending_ = true;
+    traded_price_ = trade.price;
+
+    MarketData message{};
+    message.type = MarketDataType::Trade;
+    message.symbol = symbol;
+    message.side = trade.taker_side;
+    message.price = trade.price;
+    message.quantity = trade.quantity;
+    feed_send(message);
+  }
+
+  // Called once an incoming order has been dealt with: the last price it
+  // traded at, the price it now rests at if it does, and the best prices.
+  void feed_after_submit(const Command& command, const OrderBook& book,
+                         const SubmitResult& result) noexcept {
+    if (traded_price_pending_) {
+      feed_level(command.symbol, book, opposite(command.side), traded_price_);
+      traded_price_pending_ = false;
+    }
+    if (result.resting != 0) {
+      feed_level(command.symbol, book, command.side, command.price);
+    }
+    if (result.filled != 0 || result.resting != 0) {
+      feed_best_prices(command.symbol, book, /*even_if_unchanged=*/false);
+    }
+  }
+
+  // A fresh picture of one symbol: Clear, every occupied price, best prices.
+  void feed_snapshot(SymbolId symbol, const OrderBook& book) noexcept {
+    MarketData clear{};
+    clear.type = MarketDataType::Clear;
+    clear.symbol = symbol;
+    feed_send(clear);
+    for (const Side side : {Side::Buy, Side::Sell}) {
+      book.for_each_level(side, [&](Price price, std::uint64_t quantity) {
+        MarketData message{};
+        message.type = MarketDataType::Level;
+        message.symbol = symbol;
+        message.side = side;
+        message.price = price;
+        message.quantity = quantity;
+        feed_send(message);
+      });
+    }
+    feed_best_prices(symbol, book, /*even_if_unchanged=*/true);
+  }
+
+  // Stop running a symbol. Everything queued for it ahead of this command has
+  // been handled, because commands are handled in order.
+  void handle_detach(const Command& command) noexcept {
+    assert(directory_ != nullptr && command.symbol < books_.size());
+    books_[command.symbol] = nullptr;
+    directory_->gates[command.symbol].detached.store(command.quantity,
+                                                    std::memory_order_release);
+
+    // The last thing this engine says about the symbol. Whoever reads the
+    // event ring reaches it only after every earlier event for the symbol.
+    Event handoff{};
+    handoff.symbol = command.symbol;
+    handoff.quantity = command.quantity;
+    handoff.type = EventType::Handoff;
+    if (!publish(handoff, /*count_if_discarded=*/false)) {
+      // It could not be published, which only happens when events are being
+      // discarded anyway. Nobody will ever read it, so open the gate here
+      // rather than leave the symbol stranded between engines.
+      directory_->gates[command.symbol].delivered.store(command.quantity,
+                                                       std::memory_order_release);
+    }
+  }
+
+  // Take a symbol up, if it has been handed over.
+  //
+  // Normally that means the old engine's Handoff has been read from its event
+  // ring, so that everything it said about the symbol is delivered before this
+  // engine says anything. During shutdown nobody may be reading, so it is
+  // enough that the old engine has let go.
+  bool handle_attach(const Command& command) noexcept {
+    assert(directory_ != nullptr && command.symbol < books_.size());
+    MigrationGate& gate = directory_->gates[command.symbol];
+    const std::uint32_t move_number = command.quantity;
+    const bool handed_over =
+        gate.delivered.load(std::memory_order_acquire) >= move_number ||
+        (draining_ && gate.detached.load(std::memory_order_acquire) >= move_number);
+    if (!handed_over) {
+      waiting_to_attach_ = true;
+      return false;
+    }
+    books_[command.symbol] = directory_->books[command.symbol];
+    gate.attached.store(move_number, std::memory_order_release);
+    waiting_to_attach_ = false;
+    if (feed_on_) {
+      // The symbol's market data now comes from this engine's ring, and a
+      // reader may meet these messages before the last of the old engine's.
+      // Starting with a fresh picture means it does not matter if it does.
+      feed_snapshot(command.symbol, *books_[command.symbol]);
+    }
+    return true;
+  }
+
+  // Returns false if the event had to be discarded: the ring is full and the
+  // engine is not running, or is shutting down.
+  bool publish(const Event& event, bool count_if_discarded = true) noexcept {
+    while (!events_.try_push(event)) {
+      waited_while_timing_ = true;
+      if (stop_requested_.load(std::memory_order_acquire)) {
+        if (count_if_discarded) {
+          events_dropped_.store(events_dropped_.load(std::memory_order_relaxed) + 1,
+                                std::memory_order_release);
+        }
+        return false;
+      }
+      cpu_relax();
+    }
+    return true;
+  }
+
+  std::vector<std::unique_ptr<OrderBook>> owned_;    // books this engine created, if any
+  std::vector<OrderBook*> books_;                    // the book it runs for each SymbolId, or
+                                                     // nullptr; changed only by the engine thread
+  std::vector<std::atomic<std::uint64_t>> handled_;  // commands handled, per symbol
+  std::vector<std::atomic<std::uint64_t>> timed_;    // ticks spent on the timed ones, per symbol
+  SymbolDirectory* directory_ = nullptr;             // set only for a member of a group
+  std::vector<FeedState> own_feeds_;                 // feed state for an engine with its own books
+  FeedState* feeds_;                                 // feed state by SymbolId: own, or the group's
+  std::unique_ptr<SessionRecorder> own_recorder_;    // set if this engine records by itself
+  SessionRecorder* recorder_ = nullptr;              // where commands are recorded, if anywhere:
+                                                     // its own recorder, or the group's
+  SpscRing<Command> commands_;
+  SpscRing<Event> events_;
+  SpscRing<MarketData> market_data_;
+  IdleStrategy idle_;
+  int pin_to_cpu_;
+  std::uint32_t time_one_in_;
+  bool feed_on_;
+
+  // Used only while the feed is on, by whichever thread is running the engine:
+  // the price the order being handled last traded at, whose new total has yet
+  // to be published.
+  bool traded_price_pending_ = false;
+  Price traded_price_ = 0;
+
+  // Touched only by whichever thread is running the engine. The countdown is
+  // read and written once per batch; the rest only when a command is timed.
+  //
+  // With timing off the countdown starts at zero, so counting down wraps it
+  // round instead of ever reaching zero, and no command is timed. (Strictly,
+  // one is every four billion; time_spent() still reports nothing.)
+  std::uint32_t sample_countdown_;  // commands still to pass before the next timed one
+  std::uint64_t sample_random_ = 0x9E3779B97F4A7C15ULL;
+  std::uint64_t typical_sample_x256_ = 0;  // see cap_timed_sample()
+  bool waited_while_timing_ = false;  // the timed command had to wait for the event ring
+
+  // Touched only by whichever thread is running the engine, and only when a
+  // symbol is changing hands.
+  bool waiting_to_attach_ = false;  // the queue is stopped at an Attach that is not ready
+  bool draining_ = false;           // the engine is shutting down
+
+  // True whenever the engine thread should not be (or is not) running.
+  alignas(kCacheLineSize) std::atomic<bool> stop_requested_{true};
+  std::atomic<bool> started_{false};
+  std::atomic<bool> pinned_{false};
+  std::atomic<std::uint64_t> commands_processed_{0};
+  std::atomic<std::uint64_t> events_dropped_{0};
+  std::atomic<std::uint64_t> market_data_dropped_{0};
+
+  std::thread thread_;
+};
+
+}  // namespace lob

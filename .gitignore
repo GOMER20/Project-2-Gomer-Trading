@@ -1,0 +1,22 @@
+node_modules/
+.env
+.env.local
+.data/
+dist/
+.next/
+out/
+*.log
+.DS_Store
+*.tsbuildinfo
+next-env.d.ts
+coverage/
+
+# Desktop app build output
+desktop/staging/
+release/
+desktop/.cache/
+.engine.journal
+
+# HFT builds
+hft/.cache/
+hft/bin/

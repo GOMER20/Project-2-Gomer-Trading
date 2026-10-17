@@ -1,0 +1,40 @@
+# Postgres + Redis for local development or a single-host deployment.
+# Optional: `npm run dev` starts project-local copies of both when these are not running.
+#
+#   docker compose up -d
+#
+# Credentials match the DATABASE_URL / REDIS_URL defaults in .env.example.
+# Change them (and bind addresses) before running anywhere that is not your laptop.
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: trader
+      POSTGRES_PASSWORD: trader
+      POSTGRES_DB: trading
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trader -d trading"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Everything in Redis is rebuilt by the worker within seconds, so no persistence is needed.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres-data:

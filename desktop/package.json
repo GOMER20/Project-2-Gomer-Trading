@@ -1,0 +1,67 @@
+{
+  "name": "gomer-desktop",
+  "productName": "Gomer Trading",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Gomer Trading paper trading terminal for macOS",
+  "author": "Gomer",
+  "main": "main.mjs",
+  "scripts": {
+    "stage": "node scripts/stage.mjs",
+    "start": "electron .",
+    "dist": "electron-builder --mac dmg --x64 --publish never",
+    "icon": "node scripts/make-icon.mjs"
+  },
+  "devDependencies": {
+    "electron": "^44.7.0",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "com.gomer.trading",
+    "productName": "Gomer Trading",
+    "copyright": "Simulated trading only. No real money is involved.",
+    "electronVersion": "44.7.0",
+    "electronDist": "../node_modules/electron/dist",
+    "npmRebuild": false,
+    "directories": {
+      "output": "../release",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.mjs",
+      "selftest.mjs",
+      "preload.cjs",
+      "settings-preload.cjs",
+      "loading.html",
+      "settings.html",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "staging",
+        "to": "."
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.finance",
+      "icon": "build/icon.icns",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "identity": "-",
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false
+    },
+    "dmg": {
+      "title": "Gomer Trading",
+      "artifactName": "Gomer Trading.dmg",
+      "icon": "build/icon.icns"
+    },
+    "afterPack": "scripts/after-pack.cjs"
+  }
+}

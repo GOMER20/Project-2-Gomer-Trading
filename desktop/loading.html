@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'" />
+    <title>Gomer Trading</title>
+    <style>
+      html, body { height: 100%; margin: 0; }
+      body {
+        display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px;
+        background: #06090d; color: #dbe2ea;
+        font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+        -webkit-user-select: none; cursor: default;
+      }
+      .mark {
+        width: 56px; height: 56px; border-radius: 12px; background: #f0b429; color: #06090d;
+        display: flex; align-items: center; justify-content: center; font-size: 24px; font-weight: 900; letter-spacing: -0.06em;
+      }
+      h1 { margin: 0; font-size: 15px; font-weight: 700; letter-spacing: 0.22em; }
+      p { margin: 0; color: #8492a2; }
+      .bar { width: 180px; height: 2px; background: #1d2732; overflow: hidden; border-radius: 2px; }
+      .bar::after {
+        content: ""; display: block; width: 40%; height: 100%; background: #f0b429;
+        animation: slide 1.1s ease-in-out infinite;
+      }
+      @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(250%); } }
+      @media (prefers-reduced-motion: reduce) { .bar::after { animation: none; width: 100%; } }
+    </style>
+  </head>
+  <body>
+    <div class="mark">GT</div>
+    <h1>GOMER TRADING</h1>
+    <div class="bar"></div>
+    <p>Starting your trading desk…</p>
+  </body>
+</html>

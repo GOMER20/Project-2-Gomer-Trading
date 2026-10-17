@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!-- No scripts run in this page; settings-preload.cjs wires the form. -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'" />
+    <title>Market Data</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; }
+      body {
+        padding: 22px 24px 20px; background: #0c1117; color: #dbe2ea;
+        font: 13px/1.45 ui-sans-serif, system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+        -webkit-user-select: none; cursor: default;
+      }
+      h1 { margin: 0 0 2px; font-size: 16px; font-weight: 650; }
+      .current { margin: 0 0 16px; color: #8492a2; }
+      .current b { color: #dbe2ea; font-weight: 600; }
+      ol { margin: 0 0 16px; padding-left: 18px; color: #8492a2; }
+      ol li { margin-bottom: 3px; }
+      label { display: block; margin: 12px 0 4px; font-size: 10px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #8492a2; }
+      input, select {
+        width: 100%; height: 32px; padding: 0 9px; border: 1px solid #1d2732; border-radius: 3px;
+        background: #06090d; color: #dbe2ea; font: 13px ui-monospace, "SF Mono", Menlo, monospace;
+        -webkit-user-select: text;
+      }
+      select { font-family: inherit; }
+      input:focus, select:focus { outline: none; border-color: #58a6ff; }
+      .status { min-height: 36px; margin: 14px 0 0; font-size: 12px; }
+      .status.ok { color: #22c074; }
+      .status.bad { color: #f2495c; }
+      .status.busy { color: #8492a2; }
+      .actions { display: flex; gap: 8px; margin-top: 12px; }
+      .spacer { flex: 1; }
+      button {
+        height: 32px; padding: 0 14px; border: 1px solid #1d2732; border-radius: 3px;
+        background: #121922; color: #dbe2ea; font: inherit; font-weight: 550; cursor: default;
+      }
+      button:hover:not(:disabled) { filter: brightness(1.2); }
+      button:disabled { opacity: 0.4; }
+      button.primary { border-color: #f0b429; background: #f0b429; color: #06090d; }
+      button.link { height: auto; padding: 0; border: 0; background: none; color: #58a6ff; font-weight: 400; }
+      .practice { margin: 0 0 16px; padding: 0 0 14px; border-bottom: 1px solid #1d2732; }
+      .practice label { margin-top: 0; }
+      .practice .row { display: flex; gap: 8px; }
+      .practice p { margin: 6px 0 0; color: #536170; font-size: 11px; }
+      .notes { margin: 16px 0 0; padding-top: 12px; border-top: 1px solid #1d2732; color: #536170; font-size: 11px; }
+      .notes p { margin: 0 0 5px; }
+      [hidden] { display: none !important; }
+    </style>
+  </head>
+  <body>
+    <h1>Market data</h1>
+    <p class="current">Prices now: <b id="current">…</b></p>
+
+    <div class="practice" id="practice" hidden>
+      <label for="practice-hours">Practice market hours</label>
+      <div class="row">
+        <select id="practice-hours">
+          <option value="exchange">Real exchange hours: open only when US stocks trade</option>
+          <option value="always">Around the clock: never closes</option>
+        </select>
+        <button type="button" id="apply-hours" disabled>Apply</button>
+      </div>
+      <p id="practice-note">With real exchange hours the practice market opens and closes with the US stock market, on its trading days, and prices stand still in between. Around the clock is for practising or testing at any hour.</p>
+    </div>
+
+    <ol>
+      <li>Create a free account at Alpaca. <button type="button" class="link" id="open-alpaca">Open alpaca.markets</button></li>
+      <li>In the Alpaca dashboard, choose <b>Paper Trading</b>, then <b>API Keys → Generate</b>.</li>
+      <li>Paste both values here.</li>
+    </ol>
+
+    <form id="form" autocomplete="off">
+      <label for="key">API key ID</label>
+      <input id="key" spellcheck="false" autocapitalize="off" maxlength="200" />
+
+      <label for="secret">Secret key</label>
+      <input id="secret" type="password" spellcheck="false" maxlength="200" />
+
+      <label for="feed">Feed</label>
+      <select id="feed">
+        <option value="iex">IEX — real-time, included in the free plan</option>
+        <option value="sip">SIP — full US market, needs a paid Alpaca data plan</option>
+      </select>
+
+      <p class="status" id="status" role="status"></p>
+
+      <div class="actions">
+        <button type="button" id="simulated" hidden>Use simulated prices</button>
+        <span class="spacer"></span>
+        <button type="button" id="cancel">Cancel</button>
+        <button type="button" id="test">Test</button>
+        <button type="submit" class="primary" id="save">Save and Restart</button>
+      </div>
+    </form>
+
+    <div class="notes">
+      <p>Your keys stay on this Mac, in Gomer Trading's data folder. They are used to read prices only. No order is ever sent to Alpaca.</p>
+      <p id="hours">US stocks trade 9:30 am to 4:00 pm New York time on weekdays. Outside those hours you will see the last session's prices.</p>
+      <p>Alpaca allows one live connection per account, so use these keys in one app at a time.</p>
+    </div>
+  </body>
+</html>

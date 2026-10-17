@@ -1,0 +1,43 @@
+{
+  "name": "gomer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Real-time paper trading simulator and competition platform",
+  "workspaces": [
+    "backend",
+    "frontend",
+    "desktop"
+  ],
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "services": "node scripts/dev-services.mjs",
+    "db:migrate": "npm run db:migrate -w backend",
+    "db:seed": "npm run db:seed -w backend",
+    "build": "npm run build -w backend && npm run build -w frontend",
+    "test": "npm test -w backend",
+    "typecheck": "npm run typecheck -w backend && npm run typecheck -w frontend",
+    "smoke": "npm run smoke -w backend",
+    "app:dev": "npm run stage -w desktop && npm run start -w desktop",
+    "app:build": "npm run stage -w desktop && npm run dist -w desktop",
+    "loadtest": "npm run loadtest -w backend",
+    "build:server": "node scripts/build-server.mjs",
+    "serve": "node scripts/serve.mjs",
+    "gateway:test": "npm run gateway:test -w backend",
+    "gateway:bench": "npm run gateway:bench -w backend",
+    "hft:build": "node scripts/build-hft.mjs",
+    "hft:sync": "node scripts/sync-hft.mjs"
+  },
+  "devDependencies": {
+    "embedded-postgres": "18.4.0-beta.17",
+    "redis-memory-server": "^0.17.1"
+  },
+  "engines": {
+    "node": ">=20.12"
+  },
+  "allowScripts": {
+    "redis-memory-server@0.17.1": true,
+    "@embedded-postgres/darwin-x64@18.4.0-beta.17": true,
+    "esbuild@0.28.2": true,
+    "electron@44.7.0": true
+  }
+}
